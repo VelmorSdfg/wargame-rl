@@ -1,0 +1,63 @@
+{
+  "_note": "Местность v1. cell_size — размер клетки в метрах (ARENA/cell_size = размер сетки; меньше = глаже, сетка незаметна). types: cover (доля снижения урона/подавления по цели), blocks_los (перекрывает линию огня СКВОЗЬ клетку), speed (множитель скорости). generate — параметры процедурной генерации на reset, размеры В МЕТРАХ: forest_patches [min,max] число пятен, forest_radius_m радиус пятна, buildings число зданий, building_size_m сторона здания.",
+  "cell_size": 2,
+  "types": {
+    "open": {
+      "id": 0,
+      "cover": 0.0,
+      "blocks_los": false,
+      "speed": 1.0,
+      "see_through_m": 999
+    },
+    "forest": {
+      "id": 1,
+      "cover": 0.5,
+      "blocks_los": true,
+      "speed": 0.6,
+      "see_through_m": 6,
+      "see_through_demolish_m": 100
+    },
+    "building": {
+      "id": 2,
+      "cover": 0.65,
+      "blocks_los": true,
+      "speed": 0.5,
+      "see_through_m": 0
+    },
+    "water": {
+      "id": 3,
+      "cover": 0.0,
+      "blocks_los": false,
+      "speed": 1.0,
+      "see_through_m": 999,
+      "impassable": true
+    },
+    "road": {
+      "id": 4,
+      "cover": 0.0,
+      "blocks_los": false,
+      "speed": 1.1,
+      "speed_vehicle": 1.5,
+      "see_through_m": 999
+    }
+  },
+  "_generate_note": "ВСЕ размеры В ИГРОВЫХ ЕДИНИЦАХ (код делит на cell_size, который тоже в единицах). Раньше ключи назывались *_m, и значения 7-18 читались как метры, а работали как единицы — пятна выходили радиусом 105-270 м вместо задуманного, лес занимал 32% карты кляксами, и линия огня на 300-900 м была открыта лишь в 31% случаев. При m_per_unit=15 одна единица = 15 м. Ориентир — статистика 14 годных вырезок НАСТОЯЩИХ карт (maps/platoon_pool.json): лес 21%, видимость 52%. Текущие параметры дают 12% и 50%: видимость совпала, леса чуть меньше — процедурная генерация не берёт обе цифры разом, а форму настоящей местности честнее подмешивать самими картами через --fixed-map-prob.",
+  "generate": {
+    "forest_patches": [
+      12,
+      20
+    ],
+    "forest_radius": [
+      3,
+      7
+    ],
+    "buildings": [
+      5,
+      9
+    ],
+    "building_size_m": [
+      4,
+      9
+    ]
+  }
+}

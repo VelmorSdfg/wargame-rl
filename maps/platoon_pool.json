@@ -1,0 +1,27 @@
+{
+  "_note": "ОТОБРАННЫЕ вырезки настоящих карт для поля 2550 м (ARENA=170, 85x85 клеток по 30 м). Фильтр по линии огня на 300-900 м: годно 25-85%. Отбракованные не «плохие карты», а вырожденные: в сплошном лесу бой сводится к натыканию в упор, в голой степи — к перестрелке без манёвра. Старые вырезки на 1500 м лежат в maps/old_1500/.",
+  "good": [
+    "platoon_crop_0",
+    "platoon_crop_1",
+    "platoon_crop_2",
+    "platoon_crop_3",
+    "platoon_crop_4",
+    "platoon_crop_5",
+    "platoon_crop_6",
+    "platoon_crop_7",
+    "platoon_crop_9",
+    "platoon_crop_11",
+    "platoon_crop_12",
+    "platoon_crop_13",
+    "platoon_crop_14",
+    "platoon_crop_15",
+    "platoon_crop_17",
+    "platoon_crop_18",
+    "platoon_crop_19"
+  ],
+  "rejected": {
+    "platoon_crop_10": "лес 76%, видимость 3%",
+    "platoon_crop_16": "лес 75%, видимость 7%",
+    "platoon_crop_8": "лес 49%, видимость 22%"
+  }
+}
