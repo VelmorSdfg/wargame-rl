@@ -28,12 +28,36 @@ EDGE_STRIDE = 3
 DEEP_STRIDE = 3
 
 
+FIELDS = ("cover", "speed_foot", "speed_veh", "see_limit", "see_limit_dem", "blocks", "impassable")
+
+
+def fields_from_surface(grid):
+    """Поля свойств из сетки типов. Таблица «тип -> число» раскрывается в число НА КЛЕТКУ.
+
+    Зачем так, если из типа и так всё выводится: клетка перестаёт быть меткой и становится
+    набором величин. Тогда «редкий лес», «сад», «бурьян» — это не новые типы с правкой таблиц,
+    а другие числа в тех же полях, и векторная карта может класть их напрямую, минуя тип.
+    Пока источник — тип, значения совпадают с прежними один в один."""
+    (types, cover_by_id, blocks_by_id, speed_by_id, see_through_by_id, impassable_by_id,
+     veh_speed_by_id, see_through_demolish_by_id) = _type_tables()
+    g = grid.astype(np.int32)
+    return {"cover": cover_by_id[g], "speed_foot": speed_by_id[g], "speed_veh": veh_speed_by_id[g],
+            "see_limit": see_through_by_id[g], "see_limit_dem": see_through_demolish_by_id[g],
+            "blocks": blocks_by_id[g], "impassable": impassable_by_id[g]}
+
+
 class TerrainMap:
-    """Сетка тайлов (прямоугольная, Gx×Gy) + запросы cover/speed и рейкаст линии огня."""
+    """Поля свойств на прямоугольной сетке Gx×Gy + запросы cover/speed и рейкаст линии огня.
+
+    Сетка тут — не описание местности, а посчитанная таблица: что в точке, сколько укрытия,
+    как быстро идётся, сколько метров этого материала терпит луч. Откуда она взялась — из типов
+    (старые карты) или из вектора — TerrainMap не касается.
+
+    Поле `grid` остаётся типом поверхности: по нему ищутся кромки-ориентиры и рисуется карта."""
 
     def __init__(self, grid, cell_size, cover_by_id, blocks_by_id, speed_by_id, see_through_by_id,
                  impassable_by_id, building_comp, building_id, building_centers, building_capacity=None,
-                 veh_speed_by_id=None, see_through_demolish_by_id=None, forest_id=None):
+                 veh_speed_by_id=None, see_through_demolish_by_id=None, forest_id=None, fields=None):
         self.grid = grid                      # (Gx, Gy) int id, индексируется [gx, gy]
         self.Gx, self.Gy = grid.shape
         self.G = self.Gx                      # обратная совместимость (квадратные карты)
@@ -56,6 +80,21 @@ class TerrainMap:
         self._edge_cache = None               # маска кромок, считается лениво
         self._deep_cache = {}                 # маски глубины массива по (тип, клеток)
 
+        # ПОЛЯ — то, по чему реально считается бой. Точечные запросы читают их, а не таблицы
+        # по id: так карта может прийти из вектора с непрерывными значениями, а код не заметит.
+        f = fields if fields is not None else fields_from_surface(grid)
+        self.f_cover = np.asarray(f["cover"], dtype=np.float32)
+        self.f_speed_foot = np.asarray(f["speed_foot"], dtype=np.float32)
+        self.f_speed_veh = np.asarray(f["speed_veh"], dtype=np.float32)
+        self.f_see = np.asarray(f["see_limit"], dtype=np.float32)
+        self.f_see_dem = np.asarray(f["see_limit_dem"], dtype=np.float32)
+        self.f_blocks = np.asarray(f["blocks"], dtype=bool)
+        self.f_impassable = np.asarray(f["impassable"], dtype=bool)
+        # маски для поиска ближайшего: считаются один раз, а не предикатом на каждую клетку
+        self._road_mask = (self.f_speed_foot > 1.0) | (self.f_speed_veh > 1.0)
+        self._cover_mask = self.f_cover > 0
+        self._is_building = self.grid == building_id
+
     def component_at(self, pos):
         """id здания под позицией (0 = не в здании) — для правила «своё здание прозрачно»."""
         gx, gy = self._cell(pos)
@@ -70,10 +109,9 @@ class TerrainMap:
     def passable(self, pos, is_vehicle):
         """Проходима ли клетка: вода непроходима всем; технике (is_vehicle) здания тоже непроходимы."""
         gx, gy = self._cell(pos)
-        tid = int(self.grid[gx, gy])
-        if self.impassable_by_id[tid]:
+        if self.f_impassable[gx, gy]:
             return False
-        if is_vehicle and tid == self.building_id:
+        if is_vehicle and self._is_building[gx, gy]:
             return False
         return True
 
@@ -87,20 +125,21 @@ class TerrainMap:
         return int(self.grid[gx, gy])
 
     def cover_at(self, pos):
-        return float(self.cover_by_id[self._id_at(pos)])
+        gx, gy = self._cell(pos)
+        return float(self.f_cover[gx, gy])
 
     def speed_at(self, pos, is_vehicle=False):
-        tid = self._id_at(pos)
-        return float(self.veh_speed_by_id[tid] if is_vehicle else self.speed_by_id[tid])
+        gx, gy = self._cell(pos)
+        return float(self.f_speed_veh[gx, gy] if is_vehicle else self.f_speed_foot[gx, gy])
 
-    def _nearest_matching_point(self, pos, radius, predicate):
-        """Ближайшая (в метрах) точка клетки, для чьего id predicate(id) истинно, в радиусе. None, если нет."""
+    def _nearest_matching_point(self, pos, radius, mask):
+        """Ближайшая (в метрах) точка клетки, попавшей в маску, в радиусе. None, если нет."""
         gx, gy = self._cell(pos)
         rc = int(radius / self.cell)
         best = None; bestd = 1e18
         for x in range(max(0, gx - rc), min(self.Gx, gx + rc + 1)):
             for y in range(max(0, gy - rc), min(self.Gy, gy + rc + 1)):
-                if predicate(int(self.grid[x, y])):
+                if mask[x, y]:
                     wx = (x + 0.5) * self.cell; wy = (y + 0.5) * self.cell
                     dd = (wx - pos[0]) ** 2 + (wy - pos[1]) ** 2
                     if 1e-6 < dd < bestd:
@@ -111,16 +150,16 @@ class TerrainMap:
         """Мировые координаты (не вектор!) ближайшей клетки дороги в радиусе, или None.
         Возвращает точку (не направление), чтобы вызывающий мог держать её как ФИКСИРОВАННУЮ
         цель (см. _role_move) — иначе «ближайшая точка» скачет каждый шаг и юнит дёргается."""
-        return self._nearest_matching_point(pos, radius, lambda tid: self.speed_by_id[tid] > 1.0 or self.veh_speed_by_id[tid] > 1.0)
+        return self._nearest_matching_point(pos, radius, self._road_mask)
 
     def nearest_cover_point(self, pos, radius=18.0):
         """Мировые координаты ближайшей клетки с укрытием (cover>0) в радиусе, или None.
         Точка (не направление) — для фиксации цели, см. nearest_road_point."""
-        return self._nearest_matching_point(pos, radius, lambda tid: self.cover_by_id[tid] > 0)
+        return self._nearest_matching_point(pos, radius, self._cover_mask)
 
     def nearest_cover(self, pos, radius=18.0):
         """Единичный вектор к ближайшей клетке с укрытием (cover>0) в радиусе, или None."""
-        best = self._nearest_matching_point(pos, radius, lambda tid: self.cover_by_id[tid] > 0)
+        best = self._nearest_matching_point(pos, radius, self._cover_mask)
         if best is None:
             return None
         v = np.array([best[0] - pos[0], best[1] - pos[1]], dtype=np.float32)
@@ -227,8 +266,7 @@ class TerrainMap:
         best, best_score = None, -1e18
         for x in range(max(0, gx - rc), min(self.Gx, gx + rc + 1), stride):
             for y in range(max(0, gy - rc), min(self.Gy, gy + rc + 1), stride):
-                tid = int(self.grid[x, y])
-                if self.impassable_by_id[tid]:
+                if self.f_impassable[x, y]:
                     continue
                 wx = (x + 0.5) * self.cell
                 wy = (y + 0.5) * self.cell
@@ -242,7 +280,7 @@ class TerrainMap:
                     # луч в любую точку, годных позиций нет ВООБЩЕ, и поиск запускается каждый
                     # шаг заново. Снаружи это выглядит как беготня кругами вокруг дома.
                 d_self = np.hypot(wx - pos[0], wy - pos[1])
-                score = 2.0 * float(self.cover_by_id[tid]) - 0.05 * d_self
+                score = 2.0 * float(self.f_cover[x, y]) - 0.05 * d_self
                 if score > best_score:
                     best_score, best = score, p
         return best
@@ -276,10 +314,9 @@ class TerrainMap:
                | (py < -eps) | (py > self.height_m + eps))
         gx = np.clip((px // self.cell).astype(np.int32), 0, self.Gx - 1)
         gy = np.clip((py // self.cell).astype(np.int32), 0, self.Gy - 1)
-        tid = self.grid[gx, gy]
-        blocked = self.impassable_by_id[tid] | oob
+        blocked = self.f_impassable[gx, gy] | oob
         if is_vehicle:
-            blocked = blocked | (tid == self.building_id)
+            blocked = blocked | self._is_building[gx, gy]
         any_blocked = blocked.any(axis=1)
         first = blocked.argmax(axis=1).astype(np.float32)            # индекс первого True (0 если нет)
         return np.where(any_blocked, first / nsteps, 1.0).astype(np.float32)
@@ -319,8 +356,13 @@ class TerrainMap:
         c1 = self._cell(p1)
         steps = int(dist / (self.cell * 0.5)) + 1
         step_len = dist / steps
-        thresh = self.see_through_demolish_by_id if demolish else self.see_through_by_id
-        acc = {}  # id блокирующего типа -> накоплено метров вдоль луча
+        lim = self.f_see_dem if demolish else self.f_see
+        # Копим ПО ВЕЛИЧИНЕ ПОРОГА, а не по типу клетки: у поля нет типа, у него есть число
+        # «сколько метров этого материала терпит луч». Пока карта строится из типов, это то же
+        # самое (у леса 6, у здания 0 — пороги разные). Два разных материала с ОДИНАКОВЫМ
+        # порогом здесь сложатся в один счётчик — так и должно быть: это один и тот же матовый
+        # материал с точки зрения луча.
+        acc = {}
         for s in range(1, steps):
             p = p0 + d * (s / steps)
             c = self._cell(p)
@@ -329,11 +371,11 @@ class TerrainMap:
             comp = self.building_comp[c[0], c[1]]
             if comp != 0 and comp in transparent:
                 continue  # прозрачное здание (своё / цель под фугасным огнём)
-            tid = self.grid[c[0], c[1]]
-            if not self.blocks_by_id[tid]:
+            if not self.f_blocks[c[0], c[1]]:
                 continue
-            acc[tid] = acc.get(tid, 0.0) + step_len
-            if acc[tid] > thresh[tid]:
+            t = float(lim[c[0], c[1]])
+            acc[t] = acc.get(t, 0.0) + step_len
+            if acc[t] > t:
                 return True
         return False
 
@@ -412,13 +454,21 @@ def _building_components(grid, bid):
     return building_comp, cid
 
 
-def _finalize(grid, cell, bid, building_capacity=None):
+def _finalize(grid, cell, bid, building_capacity=None, fields=None, building_comp=None):
     (types, cover_by_id, blocks_by_id, speed_by_id, see_through_by_id, impassable_by_id,
      veh_speed_by_id, see_through_demolish_by_id) = _type_tables()
-    building_comp, cid = _building_components(grid, bid)
+    if building_comp is None:
+        building_comp, cid = _building_components(grid, bid)
+    else:
+        building_comp = np.asarray(building_comp, dtype=np.int32)
+        cid = int(building_comp.max())
     building_centers = {}
     for c in range(1, cid + 1):
         xs, ys = np.where(building_comp == c)
+        if len(xs) == 0:
+            continue    # компонент без клеток: у векторных карт так бывает, когда один дом
+            #             целиком накрыт другим — перекрытые клетки достаются верхнему.
+            #             Раньше это роняло сборку карты на argmin пустой последовательности.
         mx, my = xs.mean(), ys.mean()
         # ВАЖНО: для несимметричных/разбросанных компонент (реальные слипшиеся кластеры зданий
         # на импортированных картах) геометрический центроид может упасть В РАЗРЫВ формы — вне
@@ -427,7 +477,7 @@ def _finalize(grid, cell, bid, building_capacity=None):
         building_centers[c] = ((xs[k] + 0.5) * cell, (ys[k] + 0.5) * cell)
     return TerrainMap(grid, cell, cover_by_id, blocks_by_id, speed_by_id, see_through_by_id,
                       impassable_by_id, building_comp, bid, building_centers, building_capacity,
-                      veh_speed_by_id, see_through_demolish_by_id, types["forest"]["id"])
+                      veh_speed_by_id, see_through_demolish_by_id, types["forest"]["id"], fields)
 
 
 def make_map(rng, arena):
@@ -473,6 +523,20 @@ def from_grid(grid, cell_size, building_capacity=None):
     types, *_ = _type_tables()
     bid = types["building"]["id"]
     return _finalize(grid.astype(np.int8), float(cell_size), bid, building_capacity)
+
+
+def from_fields(surface, fields, cell_size, building_capacity=None, building_comp=None):
+    """TerrainMap из ГОТОВЫХ полей — путь векторной карты (см. vectormap.py).
+
+    surface нужен по-прежнему: по нему ищутся кромки-ориентиры («опушка», «край застройки»,
+    «узел дороги») и рисуется карта. Числа же берутся из полей и могут быть какими угодно —
+    редкий лес, разбитая дорога, каменный дом отличаются значениями, а не новым типом.
+    building_comp можно передать готовым: у векторной карты дома — объекты, и искать связные
+    пятна клеток не нужно (это самая дорогая часть построения карты)."""
+    types, *_ = _type_tables()
+    bid = types["building"]["id"]
+    return _finalize(np.asarray(surface, dtype=np.int8), float(cell_size), bid,
+                     building_capacity, fields, building_comp)
 
 
 def load_ascii_map(path, cell_size, legend=None):
