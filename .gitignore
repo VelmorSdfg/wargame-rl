@@ -31,3 +31,8 @@ __pycache__/
 venv/
 .idea/
 .vscode/
+
+# Сборка .exe — производное от кода, пересобирается build_exe.py
+build/
+dist/
+*.spec

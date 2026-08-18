@@ -14,11 +14,20 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+
+# Собранный .exe разводит две вещи, которые в исходниках лежат вместе:
+#   BUNDLE — данные внутри самого exe (units.json, terrain.json, исходник wargame_env.py,
+#            из которого читаются ARENA и ZONE_RADIUS). Только чтение, правке не подлежит.
+#   ROOT   — папка РЯДОМ с exe, где живут карты и сценарии. Это рабочие файлы пользователя,
+#            и прятать их внутрь бинарника нельзя — их же надо редактировать и класть в игру.
+FROZEN = getattr(sys, "frozen", False)
+BUNDLE = getattr(sys, "_MEIPASS", os.path.dirname(HERE))
+ROOT = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(HERE)
 MAPS = os.path.join(ROOT, "maps")
 SCENARIOS = os.path.join(ROOT, "scenarios")
 
-sys.path.insert(0, ROOT)
+if not FROZEN:
+    sys.path.insert(0, ROOT)
 import terrain  # noqa: E402
 
 # Палитра — та же, что у play.py (TERRAIN_COLORS): редактор показывает карту такой, какой её
@@ -34,7 +43,7 @@ MARKER_COLORS = {"zones": (235, 205, 90), "friendly": (110, 160, 255), "enemy": 
 def _env_const(name, default):
     """Константа верхнего уровня из wargame_env.py. Возвращает (значение, найдено ли)."""
     try:
-        with open(os.path.join(ROOT, "wargame_env.py"), "r", encoding="utf-8") as f:
+        with open(os.path.join(BUNDLE, "wargame_env.py"), "r", encoding="utf-8") as f:
             src = f.read()
     except OSError:
         return default, False
@@ -42,7 +51,7 @@ def _env_const(name, default):
     return (float(m.group(1)), True) if m else (default, False)
 
 
-with open(os.path.join(ROOT, "units.json"), "r", encoding="utf-8") as _f:
+with open(os.path.join(BUNDLE, "units.json"), "r", encoding="utf-8") as _f:
     _UNITS = json.load(_f)
 
 M_PER_UNIT = float(_UNITS["m_per_unit"])
