@@ -357,7 +357,22 @@ class WarGameEnv(gym.Env):
         По умолчанию (fixed_map_files=None) поведение НЕ меняется — чистая процедурка, как раньше."""
         super().__init__()
         self.fixed_maps = []
+        self._map_cache = {}          # индекс вырезки -> готовая TerrainMap
         for path in (fixed_map_files or []):
+            # ВЕКТОРНАЯ карта: рядом лежат собранные поля (vectormap.build). Тогда ни сетки типов,
+            # ни поиска связных зданий не нужно — всё посчитано заранее и кладётся как есть.
+            if os.path.exists(path + ".fields.npz"):
+                import vectormap
+                tm, meta = vectormap.load_map(path, M_PER_UNIT)
+                span = tm.Gx * tm.cell
+                if abs(span - ARENA) > ARENA * 0.05:
+                    print(f"ВНИМАНИЕ: карта {os.path.basename(path)} покрывает {span:.0f} игр.ед "
+                          f"при поле {ARENA:.0f}. Пересоберите под этот масштаб: "
+                          f"py -3.12 vectormap.py {path}.vector.json --cell "
+                          f"{ARENA * M_PER_UNIT / tm.Gx:.0f}")
+                self._map_cache[len(self.fixed_maps)] = tm
+                self.fixed_maps.append((None, tm.cell, tm.building_capacity))
+                continue
             grid = np.load(path + ".npy")
             with open(path + ".json", "r", encoding="utf-8") as f:
                 meta = json.load(f)
@@ -754,8 +769,14 @@ class WarGameEnv(gym.Env):
             cap = {int(k): v for k, v in meta.get("building_capacity", {}).items()}
             self.map = terrain.from_grid(grid, meta["cell_m"] / M_PER_UNIT, cap)
         elif self.fixed_maps and self.np_random.random() < self.fixed_map_prob:
-            grid, cell_m, cap = self.fixed_maps[self.np_random.integers(0, len(self.fixed_maps))]
-            self.map = terrain.from_grid(grid, cell_m, cap)  # реальный вырезанный террейн (с дорогами)
+            k = int(self.np_random.integers(0, len(self.fixed_maps)))
+            # Карта неизменна в бою, а её построение — самая дорогая часть (поиск связных зданий
+            # обходит все клетки). Раньше она собиралась ЗАНОВО на каждый reset, для одних и тех
+            # же семнадцати вырезок. Кэшируем: одна сборка на карту за весь прогон.
+            if k not in self._map_cache:
+                grid, cell_m, cap = self.fixed_maps[k]
+                self._map_cache[k] = terrain.from_grid(grid, cell_m, cap)
+            self.map = self._map_cache[k]                    # реальный террейн (с дорогами)
         else:
             self.map = terrain.make_map(self.np_random, ARENA)  # процедурная местность
         self.hp = self.max_hp.copy()
