@@ -140,7 +140,7 @@ def viewshed(tm, center_m, radius_m, m_per_unit, max_rays=1440):
     gx = np.clip((xs / tm.cell).astype(np.int32), 0, tm.Gx - 1)
     gy = np.clip((ys / tm.cell).astype(np.int32), 0, tm.Gy - 1)
 
-    if getattr(tm, "vlos", None) is not None:
+    if getattr(tm, "vterr", None) is not None:
         # ПОМЕХИ ИЗ ВЕКТОРА — тем же смыслом, что в бою. Через сетку было нельзя: у неё есть
         # порог существования, и дом мельче примерно 7x7 м не даёт ни одной клетки. Просмотр
         # показывал бы свет там, где бой видит стену, — то самое расхождение, ради которого
@@ -149,7 +149,7 @@ def viewshed(tm, center_m, radius_m, m_per_unit, max_rays=1440):
         lim = np.full(xs.shape, 1e9, dtype=np.float32)
         lo_x, hi_x = float(xs.min()), float(xs.max())
         lo_y, hi_y = float(ys.min()), float(ys.max())
-        for _bnum, polys, see, _dem in tm.vlos.parts:
+        for _bnum, polys, see, _dem in tm.vterr.parts:
             for pl in polys:
                 px = [q[0] for q in pl]
                 py = [q[1] for q in pl]

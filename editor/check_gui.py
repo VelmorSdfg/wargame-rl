@@ -587,7 +587,7 @@ def main():
         fd["shapes"].append({"kind": "polygon", "type": "forest",
                              "points": [[SZ / 2 - w_m / 2, 0], [SZ / 2 + w_m / 2, 0],
                                         [SZ / 2 + w_m / 2, SZ], [SZ / 2 - w_m / 2, SZ]]})
-        vl_ = vectormap.VectorLOS(fd, P.M_PER_UNIT, cell_u=30.0 / P.M_PER_UNIT)
+        vl_ = vectormap.VectorTerrain(fd, P.M_PER_UNIT, cell_u=30.0 / P.M_PER_UNIT)
         ok(vl_.blocked(lp0, lp1) is want,
            f"лес {w_m:.0f} м {'гасит' if want else 'пропускает'} луч (порог 90 м)")
     ok(not vl_.blocked(lp0, lp1, demolish=True),
@@ -596,11 +596,46 @@ def main():
     bd = vectormap.new_doc((SZ, SZ))
     bd["shapes"].append({"kind": "building", "rect_m": [SZ / 2, SZ / 2, 40.0, 30.0, 0.0],
                          "capacity": 1})
-    vb_ = vectormap.VectorLOS(bd, P.M_PER_UNIT, cell_u=30.0 / P.M_PER_UNIT)
+    vb_ = vectormap.VectorTerrain(bd, P.M_PER_UNIT, cell_u=30.0 / P.M_PER_UNIT)
     ok(vb_.blocked(lp0, lp1) and not vb_.blocked(lp0, lp1, transparent={1}),
        "своё здание прозрачно для своего огня — номера домов те же, что у building_comp")
     ok(not vb_.blocked(((SZ / 2) / P.M_PER_UNIT, (SZ / 2) / P.M_PER_UNIT), lp1),
        "изнутри дома наружу видно: своё укрытие не мешает")
+
+    # УКРЫТИЕ И СКОРОСТЬ тоже по вектору. У клетки материал решался ДОЛЕЙ покрытия, и мелкая
+    # фигура спор проигрывала: сарай 8x6 при клетке 30 м не давал ни одной клетки, то есть и
+    # укрытия тому, кто в нём сидит. После перевода линии огня на вектор это разошлось совсем —
+    # дом пули задерживал, а своего же обитателя не прикрывал.
+    cv_doc = vectormap.new_doc((SZ, SZ))
+    cv_doc["shapes"].append({"kind": "building", "rect_m": [SZ / 2, SZ / 2, 8.0, 6.0, 0.0],
+                             "capacity": 1})
+    cv = vectormap.rasterize(cv_doc, cell_m=30.0)
+    cv_tm = terrain.from_fields(cv[0], dict(cv[1]), 30.0 / P.M_PER_UNIT)
+    cv_mid = (SZ / 2 / P.M_PER_UNIT, SZ / 2 / P.M_PER_UNIT)
+    cov_cells = cv_tm.cover_at(cv_mid)
+    cv_tm.attach_vector(cv_doc, P.M_PER_UNIT)
+    ok(cov_cells == 0.0 and cv_tm.cover_at(cv_mid) > 0.6,
+       f"сарай 8x6 укрывает того, кто в нём сидит: сеткой {cov_cells:.2f}, "
+       f"вектором {cv_tm.cover_at(cv_mid):.2f}")
+    ok(cv_tm.speed_at(cv_mid) < 0.9,
+       f"и замедляет: скорость в строении {cv_tm.speed_at(cv_mid):.2f}")
+
+    # переправа главнее спора и здесь: мост быстрее поля, брод медленнее всего
+    for is_ford, nm, fast in ((False, "мост", True), (True, "брод", False)):
+        cr = {"kind": "crossing", "point": [SZ / 2, SZ / 2]}
+        if is_ford:
+            cr["ford"] = True
+        cd = vectormap.new_doc((SZ, SZ))
+        cd["shapes"].extend([{"kind": "line", "type": "water", "width_m": 40.0,
+                              "points": [[SZ / 2, 0], [SZ / 2, SZ]]},
+                             {"kind": "line", "type": "road", "width_m": 8.0,
+                              "points": [[0, SZ / 2], [SZ, SZ / 2]]}, cr])
+        co = vectormap.rasterize(cd, cell_m=30.0)
+        ct = terrain.from_fields(co[0], dict(co[1]), 30.0 / P.M_PER_UNIT)
+        ct.attach_vector(cd, P.M_PER_UNIT)
+        ok((ct.speed_at(cv_mid) > 1.0) is fast,
+           f"{nm}: скорость {ct.speed_at(cv_mid):.2f} "
+           f"({'быстрее' if fast else 'медленнее'} поля)")
 
     # --- линейка
     # Значение снимаем ПОКА ДЕРЖИМ кнопку: линейка гаснет на отпускании (она измерение, а не

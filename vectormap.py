@@ -952,6 +952,31 @@ def points_in_poly(xs, ys, poly):
     return inside
 
 
+def _prep_poly(poly):
+    """Полигон в список готовых рёбер (ax, ay, bx, by).
+
+    ОТМЕНЁННАЯ ЗАМЕРОМ ГИПОТЕЗА: здесь стояли массивы numpy, и проверка «точка внутри» считалась
+    ими целиком. Стало ВТРОЕ ХУЖЕ — 256 мкс против 45: полигонов много, они мелкие, спрашивают
+    по одной точке, и накладные расходы numpy больше цикла из четырёх рёбер. Готовые пары
+    экономят обращения к списку и только."""
+    return [(poly[k][0], poly[k][1], poly[(k + 1) % len(poly)][0], poly[(k + 1) % len(poly)][1])
+            for k in range(len(poly))]
+
+
+def _pt_in_prep(x, y, prep):
+    inside = False
+    for ax, ay, bx, by in prep:
+        if (ay > y) != (by > y) and x < ax + (y - ay) * (bx - ax) / (by - ay):
+            inside = not inside
+    return inside
+
+
+def _polys_bbox(polys):
+    xs = [q[0] for pl in polys for q in pl]
+    ys = [q[1] for pl in polys for q in pl]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
 def _pt_in_poly(pt, poly):
     x, y = pt
     inside = False
@@ -981,8 +1006,11 @@ def _strip_quads(pts, half):
     return out
 
 
-class VectorLOS(object):
-    """Линия огня ПО ВЕКТОРУ: помеха меряется длиной луча ВНУТРИ фигуры, а не числом клеток.
+class VectorTerrain(object):
+    """Местность ПО ВЕКТОРУ: и линия огня, и материал под точкой — по фигурам, а не по клеткам.
+
+    Называлась VectorLOS, пока умела только линию огня. Переименована, когда взяла на себя
+    укрытие и скорость: имя, которое перестало описывать содержимое, — начало путаницы.
 
     Зачем вообще. У сетки есть порог существования: замерено, что при клетке 30 м строение
     мельче примерно 7x7 м не даёт ни одной клетки и для боя не существует, хотя нарисовано и
@@ -1010,7 +1038,10 @@ class VectorLOS(object):
         types, _cov, blocks, _sp, see, _imp, _veh, see_dem = terrain._type_tables()
         by_name = {name: t["id"] for name, t in types.items()}
         self.cell_u = float(cell_u)
-        self.parts = []          # (номер дома или 0, полигоны, порог, порог фугаса)
+        self.parts = []          # (номер дома или 0, полигоны, порог, порог фугаса) — помехи
+        self.areas = []          # (приоритет, id типа, полигоны) — материал под точкой
+        prio = {name: k for k, name in enumerate(PRIORITY)}
+        self.crossings = []      # (id типа, полигон) — мост и брод главнее всех
         n_build = 0
         for sh in doc.get("shapes", ()):
             kind = sh.get("kind")
@@ -1022,9 +1053,35 @@ class VectorLOS(object):
                           for q in _rect_points(cx, cy, w, h, ang)]]
                 tid = by_name["building"]
                 self.parts.append((n_build, polys, float(see[tid]), float(see_dem[tid])))
+                self.areas.append((prio["building"], tid, polys))
+                continue
+            if kind == "crossing":
+                # мост кладёт поверх воды дорогу, брод остаётся бродом — как в растеризации,
+                # где переправа ставится последней и бьёт даже застройку
+                c, length, width_m, ang = crossing_geom(doc, sh)
+                cname = "ford" if sh.get("ford") else "road"
+                poly = [((q[0] - ox) / m_per_unit, (q[1] - oy) / m_per_unit)
+                        for q in _rect_points(c[0], c[1], length, max(width_m, 4.0), ang)]
+                self.crossings.append((by_name[cname], poly))
                 continue
             tid = by_name.get(tname)
-            if tid is None or not bool(blocks[tid]):
+            if tid is None:
+                continue
+            if kind == "polygon" and len(sh.get("points", ())) >= 3:
+                self.areas.append((prio.get(tname, 0), tid,
+                                   [[((q[0] - ox) / m_per_unit, (q[1] - oy) / m_per_unit)
+                                     for q in sh["points"]]]))
+            elif kind == "line" and len(sh.get("points", ())) >= 2:
+                half_a = float(sh.get("width_m", 8.0)) / 2.0 / m_per_unit
+                pts_a = [((q[0] - ox) / m_per_unit, (q[1] - oy) / m_per_unit)
+                         for q in sh["points"]]
+                # Каждое звено ленты — ОТДЕЛЬНАЯ запись со своим габаритом. Целой лентой было
+                # нельзя: дорога в десять километров это одна фигура из двух сотен звеньев с
+                # габаритом во всю карту, габарит никогда не отказывает, и на каждый запрос
+                # проверялись все её рёбра. Замер: 248 рёбер на запрос при медиане 4 у фигуры.
+                for _q in _strip_quads(pts_a, half_a):
+                    self.areas.append((prio.get(tname, 0), tid, [_q]))
+            if not bool(blocks[tid]):
                 continue                                  # поле, дорога, вода луч не держат
             if kind == "polygon" and len(sh.get("points", ())) >= 3:
                 polys = [[((q[0] - ox) / m_per_unit, (q[1] - oy) / m_per_unit)
@@ -1038,6 +1095,19 @@ class VectorLOS(object):
                 continue
             self.parts.append((0, polys, float(see[tid]), float(see_dem[tid])))
 
+        # Материал: складываем ПО УБЫВАНИЮ приоритета и с габаритом каждой фигуры. Порядок
+        # даёт обрыв перебора на первом попадании (застройка главнее леса, лес главнее поля),
+        # габарит — дешёвый отказ до обхода рёбер. Без этих двух вещей type_at на театре стоил
+        # 62.6 мкс против 1.4 у клетки: большие полигоны леса обходились рёбрами целиком.
+        self.areas.sort(key=lambda a: -a[0])
+        self.areas = [(pr, tid, [_prep_poly(pl) for pl in polys], _polys_bbox(polys))
+                      for pr, tid, polys in self.areas]
+        self.aindex = {}
+        for i, (_p, _t, polys, _bb) in enumerate(self.areas):
+            self._put(self.aindex, i, polys)
+        self.crossings = [(tid, _prep_poly(poly), _polys_bbox([poly]))
+                          for tid, poly in self.crossings]
+
         # равномерный индекс: без него на театре пришлось бы перебирать все фигуры на КАЖДЫЙ луч
         self.index = {}
         for i, (_b, polys, _s, _d) in enumerate(self.parts):
@@ -1048,6 +1118,38 @@ class VectorLOS(object):
                 for by in range(int(math.floor(min(ys) / self.BUCKET_U)),
                                 int(math.floor(max(ys) / self.BUCKET_U)) + 1):
                     self.index.setdefault((bx, by), []).append(i)
+
+    def _put(self, index, i, polys):
+        xs = [q[0] for pl in polys for q in pl]
+        ys = [q[1] for pl in polys for q in pl]
+        for bx in range(int(math.floor(min(xs) / self.BUCKET_U)),
+                        int(math.floor(max(xs) / self.BUCKET_U)) + 1):
+            for by in range(int(math.floor(min(ys) / self.BUCKET_U)),
+                            int(math.floor(max(ys) / self.BUCKET_U)) + 1):
+                index.setdefault((bx, by), []).append(i)
+
+    def type_at(self, pos):
+        """id типа местности под точкой или None, если ни одна фигура её не накрыла (поле).
+
+        Порядок тот же, что в растеризации: сперва приоритет типов (последний в PRIORITY
+        главнее), затем переправа поверх всего. Разница только в том, что у клетки материал
+        решался ДОЛЕЙ покрытия, и мелкая фигура проигрывала спор: сарай 8x6 в клетке 30 м не
+        давал ни одной клетки, то есть не давал и укрытия тому, кто в нём сидит. Фигура же
+        либо накрывает точку, либо нет."""
+        x, y = float(pos[0]), float(pos[1])
+        # переправа главнее всего — как в растеризации, где она ставится последней
+        for tid, prep, bb in self.crossings:
+            if bb[0] <= x <= bb[2] and bb[1] <= y <= bb[3] and _pt_in_prep(x, y, prep):
+                return tid
+        key = (int(math.floor(x / self.BUCKET_U)), int(math.floor(y / self.BUCKET_U)))
+        for i in self.aindex.get(key, ()):
+            _pr, tid, polys, bb = self.areas[i]
+            if x < bb[0] or x > bb[2] or y < bb[1] or y > bb[3]:
+                continue                              # габарит отказал — рёбра не трогаем
+            for pl in polys:
+                if _pt_in_prep(x, y, pl):
+                    return tid                        # список идёт по убыванию приоритета
+        return None
 
     def _near(self, p0, p1):
         got = set()

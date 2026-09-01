@@ -115,7 +115,10 @@ class TerrainMap:
         self._road_mask = (self.f_speed_foot > 1.0) | (self.f_speed_veh > 1.0)
         self._cover_mask = self.f_cover > 0
         self._is_building = self.grid == building_id
-        self.vlos = None                 # помехи по вектору; None — считаем клетками, как раньше
+        # таблицы по id типа: нужны, когда материал приходит из вектора, а не из сетки
+        (_t, self._cover_by_id, _b, self._speed_by_id, _s, _i,
+         self._veh_by_id, _d) = _type_tables()
+        self.vterr = None                # местность по вектору; None — клетки, как раньше
 
     def attach_vector(self, doc, m_per_unit, origin_m=(0.0, 0.0)):
         """Приложить вектор карты: линия огня начнёт считать помехи по фигурам, а не по клеткам.
@@ -123,7 +126,8 @@ class TerrainMap:
         Старые растровые карты (maps/*.npy) вектора не имеют и остаются на клетках — у них нет
         источника, только результат."""
         import vectormap
-        self.vlos = vectormap.VectorLOS(doc, m_per_unit, cell_u=self.cell, origin_m=origin_m)
+        self.vterr = vectormap.VectorTerrain(doc, m_per_unit, cell_u=self.cell,
+                                            origin_m=origin_m)
         return self
 
     def component_at(self, pos):
@@ -195,10 +199,25 @@ class TerrainMap:
         return float(1.0 / (1.0 + k * grade))
 
     def cover_at(self, pos):
+        """Укрытие под точкой. По вектору, если он приложен: у клетки материал решался ДОЛЕЙ
+        покрытия, и мелкая фигура спор проигрывала — сарай 8x6 при клетке 30 м не давал ни
+        одной клетки, то есть и укрытия тому, кто в нём сидит. После того как линия огня стала
+        считаться по вектору, это разошлось совсем: дом пули задерживал, а своего же
+        обитателя не прикрывал."""
+        if self.vterr is not None:
+            tid = self.vterr.type_at(pos)
+            if tid is not None:
+                return float(self._cover_by_id[tid])
         gx, gy = self._cell(pos)
         return float(self.f_cover[gx, gy])
 
     def speed_at(self, pos, is_vehicle=False):
+        """Множитель скорости под точкой — тем же правилом, что укрытие."""
+        if self.vterr is not None:
+            tid = self.vterr.type_at(pos)
+            if tid is not None:
+                table = self._veh_by_id if is_vehicle else self._speed_by_id
+                return float(table[tid])
         gx, gy = self._cell(pos)
         return float(self.f_speed_veh[gx, gy] if is_vehicle else self.f_speed_foot[gx, gy])
 
@@ -479,8 +498,8 @@ class TerrainMap:
         # у сетки имеют ПОРОГ СУЩЕСТВОВАНИЯ — замерено, что при клетке 30 м дом мельче примерно
         # 7x7 м не даёт ни одной клетки, и луч проходит сквозь нарисованный дом. У вектора
         # порога нет, и цена та же: 0.070 мс против 0.071 на театре в 469 помех.
-        if self.vlos is not None:
-            return self.vlos.blocked(p0, p1, transparent, demolish)
+        if self.vterr is not None:
+            return self.vterr.blocked(p0, p1, transparent, demolish)
 
         blocks = self.f_blocks[ix, iy]
         if not blocks.any():
