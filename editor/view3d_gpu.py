@@ -264,6 +264,8 @@ class GLView:
         self._grids = {}                 # число делений -> (vao, число индексов)
         self._tiles = {}                 # ключ тайла -> текстура местности
         self._spare = {}                 # размер -> запас освободившихся текстур, см. upload_tile
+        self._vao_bld = None             # коробки домов одной сеткой
+        self._bld_key = None
         self._hkey = None
         self._hmap = None
         self._over = None
@@ -313,6 +315,33 @@ class GLView:
         self._vao_ground = self.ctx.vertex_array(
             self.prog_solid, [(self.ctx.buffer(gv.tobytes()), "3f 3f", "in_pos", "in_color")],
             self.ctx.buffer(gi.tobytes()))
+
+    def set_buildings(self, boxes, key=None):
+        """Коробки домов одной сеткой. Пересобираем только при смене карты: строений на театре
+        сотни, а меняются они правкой, а не кадром.
+
+        Геометрию берём из view3d.building_faces — общую с программным рисовальщиком, иначе
+        сверка их кадров в check_gui разошлась бы на первом же доме."""
+        if key is not None and key == self._bld_key:
+            return
+        self._bld_key = key
+        if self._vao_bld is not None:
+            self._vao_bld.release()
+            self._vao_bld = None
+        if not boxes:
+            return
+        verts, idx, off = [], [], 0
+        for b in boxes:
+            for quad, col in view3d.building_faces(*b):
+                c = np.repeat((np.asarray(col, dtype=np.float32) / 255.0)[None, :], 4, axis=0)
+                verts.append(np.hstack([quad, c]).astype("f4"))
+                idx.append(np.array([off, off + 1, off + 2, off, off + 2, off + 3], dtype="i4"))
+                off += 4
+        v = np.concatenate(verts)
+        i = np.concatenate(idx)
+        self._vao_bld = self.ctx.vertex_array(
+            self.prog_solid, [(self.ctx.buffer(v.tobytes()), "3f 3f", "in_pos", "in_color")],
+            self.ctx.buffer(i.tobytes()))
 
     # --- картинки тайлов
 
@@ -417,6 +446,8 @@ class GLView:
         self.ctx.enable(self.mgl.DEPTH_TEST)
         if ground and self._vao_ground is not None:
             self._vao_ground.render()
+        if self._vao_bld is not None:
+            self._vao_bld.render()
         if self._hmap is not None and draws:
             self._hmap.use(1)
             self.prog["hmap"].value = 1

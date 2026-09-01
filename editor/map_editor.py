@@ -872,6 +872,10 @@ class EditorFrame(ttk.Frame):
         # Предупреждение о разрыве сети от тумблера теперь НЕ зависит: оно в сведениях и
         # показывается всегда, иначе выключенный показ молча гасил бы и диагностику.
         self.show_graph = tk.BooleanVar(value=False)
+        # Дома в объёме — КОРОБКАМИ. У строения в бою высоты нет (оно перекрывает обзор целиком
+        # независимо от неё), так что высота показная — как срез грунта под картой. Но плоское
+        # чёрное пятно на местности не читается как дом, и село с высоты выглядит асфальтом.
+        self.show_houses3d = tk.BooleanVar(value=True)
         self.grid_alpha = 0.6
         self.metrics = None
 
@@ -1317,6 +1321,8 @@ class EditorFrame(ttk.Frame):
                  self.show_shade, self.draw),
                 ("узлы дорог", "перекрёстки и разрывы — то, чем ходит поиск пути",
                  self.show_graph, self._changed),
+                ("дома объёмом", "коробки вместо плоских пятен (высота показная)",
+                 self.show_houses3d, self.draw),
                 ("сетка полей", "клетки, которыми карту читает бой",
                  self.show_grid, self.draw),
                 ("счётчик кадров", "цена отрисовки в миллисекундах",
@@ -1670,6 +1676,34 @@ class EditorFrame(ttk.Frame):
             used.append(gkey)
         return draws, used, waiting
 
+    def _building_boxes(self):
+        """Дома для объёмного вида: (центр, стороны, поворот, низ, верх) в метрах.
+
+        Низ берётся по САМОМУ НИЗКОМУ из четырёх углов следа и опускается ещё на метр. Иначе на
+        склоне дом, посаженный на высоту центра, одним углом висит в воздухе, а другим тонет;
+        так он просто врезан в подъём, как настоящий.
+
+        Высота — из h_m фигуры, если её задали, иначе условная по следу."""
+        if not self.show_houses3d.get():
+            return []
+        cell = self._height_cell()
+        h = self.doc.height_m(cell)
+        out = []
+        for sh in self.doc.shapes:
+            if sh["kind"] != "building":
+                continue
+            cx, cy, bw, bh, ang = sh["rect_m"]
+            pts = vectormap._rect_points(cx, cy, bw, bh, ang)
+            if h is None:
+                z0 = 0.0
+            else:
+                zs = [float(h[int(np.clip(q[0] / cell, 0, h.shape[0] - 1)),
+                              int(np.clip(q[1] / cell, 0, h.shape[1] - 1))]) for q in pts]
+                z0 = min(zs)
+            hgt = float(sh.get("h_m") or view3d.building_height_m(bw, bh))
+            out.append((cx, cy, bw, bh, ang, z0 - 1.0, z0 + hgt))
+        return out
+
     def _gl_frame(self):
         """Кадр видеокартой или None, если её нет. Контекст, поле высот и картинки тайлов живут
         между кадрами: заводить их заново — 400 мс на контекст, от выигрыша не осталось бы
@@ -1683,6 +1717,9 @@ class EditorFrame(ttk.Frame):
             cell_h = self._height_cell()
             height = self.doc.height_m(cell_h)
             self._gl.set_height(height, cell_h, key=(self.doc.hversion, cell_h))
+            self._gl.set_buildings(self._building_boxes(),
+                                   key=(self.doc.version, self.doc.hversion,
+                                        self.show_houses3d.get()))
             grid = self._tile_grid()
             top = (grid.levels - 1, 0, 0)
             if grid.get(top) is None:
@@ -1760,7 +1797,7 @@ class EditorFrame(ttk.Frame):
             # надвыборка только на неподвижном кадре: вчетверо дороже, зато без лесенки по краям
             img = view3d.render(surface, height, cell_used, self.cam, (self.W, self.H),
                                 coarse=coarse, ss=1 if self._cam_drag else 2,
-                                ground=True)
+                                ground=True, buildings=self._building_boxes())
         self._shapes_overlay_3d(img)
         self._draft_overlay_3d(img)
         self._ruler_overlay_3d(img)

@@ -243,8 +243,52 @@ def project(xs, ys, hs, cam, size, fov_px=None):
     return w / 2 + xr * f, h / 2 - yc * f, zc
 
 
+BUILDING_WALL = np.array([176, 168, 158], dtype=np.float32)   # стены светлее местности
+BUILDING_ROOF = np.array([116, 108, 100], dtype=np.float32)   # крыша темнее стен
+
+
+def building_height_m(w_m, h_m):
+    """Условная высота дома по его следу. В бою высоты у строения НЕТ — оно перекрывает обзор
+    целиком независимо от того, что нарисовано, — поэтому число здесь показное, как срез грунта
+    под картой: глазу опора, бою ничего.
+
+    Считаем от УЗКОЙ стороны: длинный сарай не становится башней оттого, что он длинный."""
+    return float(np.clip(0.75 * min(w_m, h_m), 4.0, 20.0))
+
+
+def building_faces(cx, cy, w_m, h_m, ang_deg, z_lo_m, z_hi_m):
+    """Пять видимых граней коробки дома — четыре стены и крыша — в МИРОВЫХ координатах.
+
+    Общая на оба рисовальщика нарочно: check_gui сверяет их кадры, и разойдись геометрия хоть
+    на градус освещения, сверка бы покраснела. Заодно и правда одна: дом обязан выглядеть
+    одинаково с видеокартой и без неё.
+
+    Высоты умножаются на VSCALE — в тех же единицах живут местность и срез грунта, и дом,
+    построенный в чистых метрах, оказался бы вдвое ниже холма рядом.
+
+    Пол не рисуем: снизу на дом не смотрят, а грань стоит места в списке."""
+    a = math.radians(ang_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    hw, hh = w_m / 2.0, h_m / 2.0
+    corners = [(cx + dx * ca - dy * sa, cy + dx * sa + dy * ca)
+               for dx, dy in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))]
+    z_lo, z_hi = z_lo_m * VSCALE, z_hi_m * VSCALE
+    out = []
+    for k in range(4):
+        (x1, y1), (x2, y2) = corners[k], corners[(k + 1) % 4]
+        nx, ny = (y2 - y1), -(x2 - x1)          # наружная нормаль обхода против часовой
+        L = math.hypot(nx, ny) or 1.0
+        lam = float(np.clip(0.88 + 0.45 * (nx / L * SUN[0] + ny / L * SUN[1]), 0.55, 1.30))
+        out.append((np.array([[x1, y1, z_lo], [x2, y2, z_lo],
+                              [x2, y2, z_hi], [x1, y1, z_hi]], dtype=np.float32),
+                    np.clip(BUILDING_WALL * lam, 0, 255)))
+    out.append((np.array([[c[0], c[1], z_hi] for c in corners], dtype=np.float32),
+                np.clip(BUILDING_ROOF * (0.9 + 0.4 * float(SUN[2])), 0, 255)))
+    return out
+
+
 def render(surface, height_m, cell_m, cam, size, coarse=1, markers=None, ss=1,
-           ground=True):
+           ground=True, buildings=None):
     """Кадр объёмного вида. surface — сетка типов (Gx,Gy), height_m — высоты в метрах.
 
     ss — надвыборка: рисуем в ss раз крупнее и ужимаем. Ступеньки на краях четырёхугольников
@@ -252,7 +296,8 @@ def render(surface, height_m, cell_m, cam, size, coarse=1, markers=None, ss=1,
     кадре, когда мышь отпущена."""
     if ss > 1:
         img = render(surface, height_m, cell_m, cam,
-                     (size[0] * ss, size[1] * ss), coarse, markers, ss=1, ground=ground)
+                     (size[0] * ss, size[1] * ss), coarse, markers, ss=1, ground=ground,
+                     buildings=buildings)
         return img.resize(size, Image.LANCZOS)
     if coarse > 1:
         surface = surface[::coarse, ::coarse]
@@ -300,6 +345,16 @@ def render(surface, height_m, cell_m, cam, size, coarse=1, markers=None, ss=1,
     if ground:
         for gx_, gy_, gc_, gd_ in _ground_quads(xs, ys, hh, cam, size):
             qx.append(gx_); qy.append(gy_); qc.append(gc_); qd.append(gd_)
+    # Коробки домов идут в ТОТ ЖЕ список четырёхугольников: их и отсортирует по глубине общий
+    # проход художника, и дымкой затянет наравне с местностью. Отдельным слоем поверх кадра
+    # дом бы не закрывался холмом и висел бы над всем, что перед ним.
+    for b in (buildings or ()):
+        for quad, col in building_faces(*b):
+            bx, by, bz = project(quad[:, 0], quad[:, 1], quad[:, 2], cam, size)
+            qx.append(bx.reshape(1, 4).astype(np.float32))
+            qy.append(by.reshape(1, 4).astype(np.float32))
+            qc.append(col.reshape(1, 3))
+            qd.append(np.array([float(bz.mean())], dtype=np.float32))
     QX = np.concatenate(qx); QY = np.concatenate(qy)
     QC = np.concatenate(qc); QD = np.concatenate(qd)
 
