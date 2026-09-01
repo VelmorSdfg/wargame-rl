@@ -140,26 +140,20 @@ def viewshed(tm, center_m, radius_m, m_per_unit, max_rays=1440):
     gx = np.clip((xs / tm.cell).astype(np.int32), 0, tm.Gx - 1)
     gy = np.clip((ys / tm.cell).astype(np.int32), 0, tm.Gy - 1)
 
-    if getattr(tm, "vterr", None) is not None:
-        # ПОМЕХИ ИЗ ВЕКТОРА — тем же смыслом, что в бою. Через сетку было нельзя: у неё есть
-        # порог существования, и дом мельче примерно 7x7 м не даёт ни одной клетки. Просмотр
-        # показывал бы свет там, где бой видит стену, — то самое расхождение, ради которого
-        # вектор и заводился.
-        blocks = np.zeros(xs.shape, dtype=bool)
-        lim = np.full(xs.shape, 1e9, dtype=np.float32)
-        lo_x, hi_x = float(xs.min()), float(xs.max())
-        lo_y, hi_y = float(ys.min()), float(ys.max())
-        for _bnum, polys, see, _dem in tm.vterr.parts:
-            for pl in polys:
-                px = [q[0] for q in pl]
-                py = [q[1] for q in pl]
-                if max(px) < lo_x or min(px) > hi_x or max(py) < lo_y or min(py) > hi_y:
-                    continue                      # фигура вне окна просмотра
-                m = vectormap.points_in_poly(xs, ys, pl)
-                if not m.any():
-                    continue
-                blocks |= m
-                lim = np.where(m, np.minimum(lim, see), lim)
+    vb = getattr(tm, "f_blocks_vec", None)
+    if vb is not None:
+        # ПОМЕХИ ИЗ ВЕКТОРА, но разложенные по клеткам ОДИН РАЗ НА ОКНО (vector_occluders).
+        #
+        # Сперва здесь стоял честный перебор: каждая фигура против всех точек лучей. Смысл был
+        # верный, цена — нет: на театре это десятки миллионов проверок, и просмотр стоил 332 мс
+        # на движение мыши вместо трёх. Клетки для ПОКАЗА достаточно, а порог существования,
+        # ради которого вектор и заводился, снят иначе — отметкой по ЛЮБОМУ касанию, а не по
+        # доле покрытия: сарай 8x6 свою клетку получает.
+        #
+        # Бой при этом считает точной геометрией (terrain.blocked): показ огрубляет тень мелкого
+        # дома до клетки, но не теряет её.
+        blocks = vb[gx, gy]
+        lim = tm.f_see_vec[gx, gy]
     else:
         blocks = tm.f_blocks[gx, gy]
         lim = tm.f_see[gx, gy]
@@ -957,6 +951,7 @@ class EditorFrame(ttk.Frame):
         self._ruler = None              # два конца линейки, в метрах
         self._box3d = None              # рамка выделения в объёме, в ПИКСЕЛЯХ экрана
         self._vision = None             # (точка, маска видимости, клетка, угол окна)
+        self._vis_key = None            # чем помечена залитая маска: чтобы не заливать зря
         self._vis_tm = None             # собранный кусок местности под видимость, с ключом
         self._drag = None
         self._panning = False
@@ -1658,6 +1653,19 @@ class EditorFrame(ttk.Frame):
                 self._tiles.stop()
             self._tiles = tilemod.TileGrid(self.doc.vec, self.doc.size_m)
         self._tiles.set_mode(self.map_style.get())
+        # ВО ВРЕМЯ ПРОТЯЖКИ куски не пересчитываем. Каждое движение мыши меняет версию карты, а
+        # версия сбрасывает задетые куски: замер показал, что одно движение выбрасывало все 39
+        # готовых, и кадр протяжки стоил 304 мс против 53 спокойного. Пометка задетой округи не
+        # спасает — у крупного полигона она в пол-экрана.
+        # Куда фигура едет, показывает ОБВОДКА поверх кадра, а местность догонит на отпускании:
+        # там вызывается _changed, который и метит округу. Тем же правилом живёт граф дорог.
+        #
+        # Признак — ИМЕННО протяжка фигуры, а не общий «занят». Первая попытка взяла готовый
+        # _graph_busy, а он считает занятостью и движение камеры — куски же от камеры зависят
+        # напрямую, и они переставали обновляться совсем: набор покраснел сразу четырьмя
+        # проверками, включая «печать рельефа сбрасывает округу» с нулём пересчитанных кусков.
+        if self._drag and self._drag[0] in ("move", "node"):
+            return self._tiles
         # Версия составная и ОДНА НА ВСЕ СТИЛИ: картинка куска зависит от фигур, а в топостиле
         # ещё и от высоты. Пока версия зависела от текущего стиля, переключение стиля само
         # читалось как смена карты — все готовые куски выбрасывались, и на их месте оставался
@@ -1768,8 +1776,12 @@ class EditorFrame(ttk.Frame):
             # понадобится, — а заливка картинки это построение мипмапов на 544x544
             self._gl.keep_tiles(used, limit=tilemod.MAX_TILES if grid.mode == "vector" else 400)
             if self._vision:
-                rgba, vcell, vorigin = self._vision_rgba()
-                self._gl.set_overlay(rgba, vcell, vorigin)
+                # маску пересобираем ТОЛЬКО когда она поменялась: она не зависит от камеры, а
+                # заливка текстуры на каждый кадр съедала просмотр целиком
+                key_v = (id(self._vision[1]), float(self.vision_r.get()))
+                if key_v != getattr(self, "_vis_key", None):
+                    self._vis_key = key_v
+                    self._gl.set_overlay(*self._vision_rgba())
             else:
                 self._gl.clear_overlay()
             img = self._gl.frame(self.cam, draws, size=(self.W, self.H),
@@ -3065,6 +3077,49 @@ class EditorFrame(ttk.Frame):
                 self.doc.bump()
                 self.draw()
 
+    @staticmethod
+    def _vector_occluders(tm):
+        """Помехи вектора -> две сетки окна: «держит луч» и «сколько метров терпит».
+
+        Отметка идёт по ЛЮБОМУ касанию клетки, а не по доле покрытия: у доли есть порог
+        существования (дом мельче примерно 7x7 м при клетке 30 м не даёт ни одной), а вся затея
+        с вектором была ради того, чтобы такой дом существовал. Считается один раз на окно и
+        живёт вместе с ним, поэтому движение мыши бесплатно."""
+        Gx, Gy = tm.grid.shape
+        blocks = np.zeros((Gx, Gy), dtype=bool)
+        lim = np.full((Gx, Gy), 1e9, dtype=np.float32)
+        cx = (np.arange(Gx) + 0.5) * tm.cell
+        cy = (np.arange(Gy) + 0.5) * tm.cell
+        for _bnum, polys, see, _dem in tm.vterr.parts:
+            for pl in polys:
+                px = [q[0] for q in pl]
+                py = [q[1] for q in pl]
+                i0 = max(0, int(min(px) / tm.cell) - 1)
+                i1 = min(Gx, int(max(px) / tm.cell) + 2)
+                j0 = max(0, int(min(py) / tm.cell) - 1)
+                j1 = min(Gy, int(max(py) / tm.cell) + 2)
+                if i0 >= i1 or j0 >= j1:
+                    continue                       # фигура вне окна
+                X, Y = np.meshgrid(cx[i0:i1], cy[j0:j1], indexing="ij")
+                m = vectormap.points_in_poly(X, Y, pl)
+                if not m.any():
+                    # мелкая фигура может не накрыть ни одного ЦЕНТРА клетки, а существовать
+                    # обязана: отмечаем клетку, в которую попал её центр
+                    mx = (min(px) + max(px)) * 0.5
+                    my = (min(py) + max(py)) * 0.5
+                    gi = int(np.clip(mx / tm.cell, 0, Gx - 1))
+                    gj = int(np.clip(my / tm.cell, 0, Gy - 1))
+                    blocks[gi, gj] = True
+                    lim[gi, gj] = min(float(lim[gi, gj]), see)
+                    continue
+                sub_b = blocks[i0:i1, j0:j1]
+                sub_l = lim[i0:i1, j0:j1]
+                sub_b |= m
+                np.minimum(sub_l, np.where(m, see, 1e9), out=sub_l)
+        tm.f_blocks_vec = blocks
+        tm.f_see_vec = lim
+        return tm
+
     def _vision_terrain(self, p, radius_m, cell):
         """Кусок местности вокруг точки, собранный НАСТОЯЩИМ движком боя.
 
@@ -3098,6 +3153,7 @@ class EditorFrame(ttk.Frame):
         tm = terrain.from_fields(surf, fields, cell / P.M_PER_UNIT)
         # тем же вектором, что и бой: просмотр прострелов не должен показывать своё
         tm.attach_vector(self.doc.vec, P.M_PER_UNIT, origin_m=(x0, y0))
+        self._vector_occluders(tm)        # раскладываем помехи по клеткам окна один раз
         self._vis_tm = (key, tm)
         return tm, (x0, y0)
 
@@ -3198,13 +3254,33 @@ class EditorFrame(ttk.Frame):
             hp = min(hits, key=lambda h: (h[0] - q[0]) ** 2 + (h[1] - q[1]) ** 2)
             sh["point"] = [round(float(hp[0]), 1), round(float(hp[1]), 1)]
 
+    def _touch(self, rect):
+        """Пометить округу к пересчёту кусков, объединяя с уже помеченным.
+
+        Во время протяжки _changed НЕ зовут — он дорогой, — и округа оставалась пустой. А пустая
+        означает «поменялось всё»: замер показал, что одно движение мыши выбрасывало ВСЕ готовые
+        куски (39 из 39), и кадр протяжки стоил 304 мс против 53 спокойного. Теперь помечаем
+        ровно то, что задели."""
+        if rect is None:
+            return
+        x0, y0, x1, y1 = rect
+        cur = self._dirty_rect
+        if cur is None:
+            self._dirty_rect = (x0, y0, x1, y1)
+        else:
+            self._dirty_rect = (min(cur[0], x0), min(cur[1], y0),
+                                max(cur[2], x1), max(cur[3], y1))
+
     def _apply_node(self, data, p):
         """Узел встал туда, куда показывает курсор. Общее для плана и объёма: в объёме p — это
         точка ЗЕМЛИ под курсором, и разница только в том, чем её получили."""
         si, k = data[0], data[1]
+        was = self._shape_rect(self.doc.shapes[si])
         self.doc.shapes[si]["points"][k] = [round(p[0], 1), round(p[1], 1)]
         if len(data) > 2:
             self._reanchor_crossings(data[2])
+        self._touch(was)
+        self._touch(self._shape_rect(self.doc.shapes[si]))
         self.doc.bump()
 
     def _apply_move(self, data, p):
@@ -3216,6 +3292,8 @@ class EditorFrame(ttk.Frame):
         Ровно та болезнь, от которой камеру в своё время перевели на обратную проекцию."""
         p0, group = data[0], data[1]
         dx, dy = p[0] - p0[0], p[1] - p0[1]
+        for i, _orig in group:
+            self._touch(self._shape_rect(self.doc.shapes[i]))     # где фигура была
         for i, orig in group:
             sh = self.doc.shapes[i]
             if orig["kind"] in ("polygon", "line"):
@@ -3229,6 +3307,8 @@ class EditorFrame(ttk.Frame):
                                round(orig["point"][1] + dy, 1)]
         if len(data) > 2:
             self._reanchor_crossings(data[2])
+        for i, _orig in group:
+            self._touch(self._shape_rect(self.doc.shapes[i]))     # и куда переехала
         self.doc.bump()
 
     @staticmethod
@@ -3409,9 +3489,12 @@ class EditorFrame(ttk.Frame):
                 self._finish_box_3d(add=True)
             elif self._drag and self._drag[0] in ("move", "node"):
                 # _changed обязателен: он пересобирает поля, проверяет пересечения на переправы
-                # и метит округу к пересчёту. Без него правка осталась бы только на картинке
+                # и метит округу к пересчёту. Без него правка осталась бы только на картинке.
+                # Округу передаём НАКОПЛЕННУЮ за протяжку (_touch): без неё _changed пометил бы
+                # «поменялось всё», и на отпускании пересчитывалась бы вся карта разом — во
+                # время протяжки-то куски не трогали.
                 self._drag = None
-                self._changed()
+                self._changed(dirty=self._dirty_rect)
                 self._refresh_points()
             self.draw_3d()                 # отпустили — перерисовать в полном разрешении
             return
@@ -3431,7 +3514,7 @@ class EditorFrame(ttk.Frame):
             return self._finish_box(ev)
         if self._drag and self._drag[0] in ("move", "node", "building", "building_rot",
                                             "crossing_rot", "marker"):
-            self._changed()
+            self._changed(dirty=self._dirty_rect)
         self._drag = None
         self._refresh_points()
 
