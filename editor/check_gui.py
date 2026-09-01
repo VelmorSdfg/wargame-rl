@@ -552,6 +552,51 @@ def main():
     ok(True, "режим «кругом» рисуется без ошибок")
     e.ruler_circle.set(False)
 
+    # Просмотр прострелов обязан считать РЕЛЬЕФ, а не только материал. Пока он смотрел лишь на
+    # лес и строения, холм между наблюдателем и целью для него не существовал: обратный скат
+    # подсвечивался как видимый. Обманывало вдвойне — маска ложится на объёмную местность,
+    # обтекает холм, и глаз заключает, что холм учтён. Бой при этом рельеф считал, и замер
+    # годности карты тоже: расходился ровно тот показ, по которому выбирают позиции.
+    vs_cx, vs_cy = W_m / 2, H_m / 2
+    e.push_undo()
+    h_keep, slope_keep = e.relief_h.get(), e.relief_slope.get()
+    e.relief_h.set(60.0)
+    e.relief_slope.set(60.0)
+    e._stamp_relief({"kind": "polygon", "type": "relief",
+                     "points": [[vs_cx - 900, vs_cy + 40], [vs_cx + 900, vs_cy + 40],
+                                [vs_cx + 900, vs_cy + 160], [vs_cx - 900, vs_cy + 160]]})
+    eye_m = np.array([vs_cx, vs_cy - 400.0], dtype=np.float32)
+    vtm, vorg = e._vision_terrain(eye_m, 900.0, e.doc.cell_m)
+    vloc = np.array([eye_m[0] - vorg[0], eye_m[1] - vorg[1]], dtype=np.float32)
+    vfield = ed.viewshed(vtm, vloc, 900.0, P.M_PER_UNIT)
+
+    def vs_at(wx, wy):
+        lx = (wx - vorg[0]) / P.M_PER_UNIT
+        ly = (wy - vorg[1]) / P.M_PER_UNIT
+        return float(vfield[int(np.clip(lx / vtm.cell, 0, vtm.Gx - 1)),
+                            int(np.clip(ly / vtm.cell, 0, vtm.Gy - 1))])
+
+    ok(vs_at(vs_cx, vs_cy - 120.0) > 0.5 and vs_at(vs_cx, vs_cy + 320.0) < 0.5,
+       f"просмотр прячет обратный скат за грядой: перед ней "
+       f"{vs_at(vs_cx, vs_cy - 120.0):.2f}, за ней {vs_at(vs_cx, vs_cy + 320.0):.2f}")
+
+    # Контроль: сверяем с ТЕМ ЖЕ terrain.blocked, которым считает бой и мерка годности.
+    # Убери проверку гребня из viewshed — эта строка покраснеет.
+    agree = total = 0
+    vp0 = (vloc[0] / P.M_PER_UNIT, vloc[1] / P.M_PER_UNIT)
+    for ddy in range(-350, 700, 50):
+        for ddx in (-200, 0, 200):
+            wx_, wy_ = vs_cx + ddx, vs_cy + ddy
+            vp1 = ((wx_ - vorg[0]) / P.M_PER_UNIT, (wy_ - vorg[1]) / P.M_PER_UNIT)
+            total += 1
+            if (not vtm.blocked(vp0, vp1)) == (vs_at(wx_, wy_) > 0.5):
+                agree += 1
+    ok(agree >= total * 0.9,
+       f"просмотр сходится с боевым terrain.blocked на {agree} из {total} точек")
+    e.relief_h.set(h_keep)
+    e.relief_slope.set(slope_keep)
+    e.do_undo()
+
     # --- просмотр видимости настоящей моделью линии огня
     e.tool.set("vision")
     e.vision_r.set(900.0)
