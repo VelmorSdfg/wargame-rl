@@ -102,11 +102,13 @@ uniform mat4 mvp;
 in vec3 in_pos;
 in vec3 in_color;
 out vec3 v_color;
+out vec2 v_world;
 out float v_depth;
 void main() {
     vec4 p = mvp * vec4(in_pos, 1.0);
     gl_Position = p;
     v_color = in_color;
+    v_world = in_pos.xy;
     v_depth = p.w;
 }
 """
@@ -116,12 +118,27 @@ FRAG_SOLID = """
 uniform vec3 fog_color;
 uniform float fog_far;
 uniform float fog_amount;
+uniform sampler2D over;    // то же наложение, что на местности: зона видимости
+uniform vec4 over_uv;
+uniform float over_on;     // срезу грунта наложение ни к чему, домам — нужно
 in vec3 v_color;
+in vec2 v_world;
 in float v_depth;
 out vec4 f_color;
 void main() {
+    vec3 col = v_color;
+    // Дом обязан затеняться зоной видимости наравне с землёй под ним. Пока наложение висело
+    // только на шейдере местности, коробка стояла ЯРКОЙ посреди затенённого поля, и читалось
+    // это как «строение зону не перекрывает» — хотя перекрывает: за ним ноль.
+    if (over_on > 0.5) {
+        vec2 ouv = v_world * over_uv.xy + over_uv.zw;
+        if (ouv.x >= 0.0 && ouv.x <= 1.0 && ouv.y >= 0.0 && ouv.y <= 1.0) {
+            vec4 o = texture(over, ouv);
+            col = mix(col, o.rgb, o.a);
+        }
+    }
     float fog = pow(clamp(v_depth / fog_far, 0.0, 1.0), FOGP) * fog_amount;
-    f_color = vec4(mix(v_color, fog_color, fog), 1.0);
+    f_color = vec4(mix(col, fog_color, fog), 1.0);
 }
 """.replace("FOGP", "%.3f" % view3d.FOG_POW)
 
@@ -444,10 +461,18 @@ class GLView:
         self.ctx.disable(self.mgl.DEPTH_TEST)
         self.vao_sky.render()
         self.ctx.enable(self.mgl.DEPTH_TEST)
+        # Срез грунта наложением не красим: он ниже местности и к зоне видимости не относится
+        self.prog_solid["over_on"].value = 0.0
         if ground and self._vao_ground is not None:
             self._vao_ground.render()
         if self._vao_bld is not None:
+            if self._over is not None:
+                self._over.use(2)
+                self.prog_solid["over"].value = 2
+                self.prog_solid["over_uv"].value = self._over_uv
+                self.prog_solid["over_on"].value = 1.0
             self._vao_bld.render()
+            self.prog_solid["over_on"].value = 0.0
         if self._hmap is not None and draws:
             self._hmap.use(1)
             self.prog["hmap"].value = 1

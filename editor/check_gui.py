@@ -1645,6 +1645,24 @@ def main():
         ok(abs(view3d.building_height_m(60.0, 12.0)
                - view3d.building_height_m(12.0, 12.0)) < 1e-6,
            "высота дома берётся от узкой стороны, а не от длины")
+        # Зона видимости обязана красить и КОРОБКИ, а не только землю. Пока наложение висело
+        # только на шейдере местности, дом стоял ярким посреди затенённого поля — и это
+        # читалось как «строение зону не перекрывает», хотя за ним ноль. Дом ставится
+        # ОТДЕЛЬНО и крупно, чтобы полоса замера гарантированно пришлась на стены.
+        one = [(500.0, 500.0, 120.0, 80.0, 0.0, 0.0, view3d.building_height_m(120.0, 80.0))]
+        gl.set_buildings(one, key=("проба", 2))
+        h_plain = np.asarray(gl.frame(near, whole)).astype(float)
+        tint = np.zeros((64, 64, 4), dtype=np.uint8)
+        tint[..., 2] = 255
+        tint[..., 3] = 220
+        gl.set_overlay(tint, 2550.0 / 64, origin=(0.0, 0.0))
+        h_shaded = np.asarray(gl.frame(near, whole)).astype(float)
+        band = (slice(120, 190), slice(150, 250))
+        blue0 = float(h_plain[band][..., 2].mean() - h_plain[band][..., 0].mean())
+        blue1 = float(h_shaded[band][..., 2].mean() - h_shaded[band][..., 0].mean())
+        ok(blue1 > blue0 + 20.0,
+           f"зона видимости красит и коробки домов: синева {blue0:.0f} -> {blue1:.0f}")
+        gl.clear_overlay()
         gl.set_buildings([], key=("проба", 0))
 
         # то же самое, но КУСКАМИ: местность, собранная из четырёх кусков, обязана совпасть с
