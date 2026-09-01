@@ -21,10 +21,19 @@ VIS_MIN, VIS_MAX = 0.25, 0.85
 BAND_M = (300.0, 900.0)
 
 
-def measure(grid, cell_m, n_pairs=600, seed=12345):
-    """Доли типов, видимость на боевой дистанции, строения и вердикт годности."""
+def measure(grid, cell_m, n_pairs=600, seed=12345, fields=None):
+    """Доли типов, видимость на боевой дистанции, строения и вердикт годности.
+
+    fields — поля из vectormap.rasterize. Их стоит передавать всегда, когда они есть: там
+    лежит высота, а без неё видимость меряется по плоской карте и завышается — гряда, которая
+    в бою закроет полполя, для мерки не существует."""
     Gx, Gy = grid.shape
-    tm = terrain.from_grid(grid, cell_m / P.M_PER_UNIT)
+    if fields is not None:
+        f = dict(fields)
+        f["height"] = np.asarray(f.get("height", 0.0), dtype=np.float32) / P.M_PER_UNIT
+        tm = terrain.from_fields(grid, f, cell_m / P.M_PER_UNIT)
+    else:
+        tm = terrain.from_grid(grid, cell_m / P.M_PER_UNIT)
     rng = np.random.default_rng(seed)
     lo_u, hi_u = BAND_M[0] / P.M_PER_UNIT, BAND_M[1] / P.M_PER_UNIT
 
