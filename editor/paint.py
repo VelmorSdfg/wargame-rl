@@ -40,6 +40,15 @@ TOPO_INDEX = (150, 92, 50)              # утолщённая — каждая 
 TOPO_WATER_EDGE = (60, 130, 175)
 TOPO_EDGE = (58, 92, 52)                # контур растительности и знаки пород — тёмно-зелёные
 
+WATER_ALPHA = 0.72                      # непрозрачность воды в ЖИВОМ стиле.
+#                            Сплошная заливка читалась как синяя лента поверх карты, а не как
+#                            река: дно не видно, и берег ничем не отличается от края фигуры.
+#                            Прозрачность даёт и полезное, а не только красивое — под водой
+#                            остаётся видна ДОРОГА, потому что она рисуется раньше воды. Там,
+#                            где дорога уходит в реку и не выходит мостом, это сразу заметно.
+#                            В топостиле вода СПЛОШНАЯ: голубая заливка там условный знак, и
+#                            размывать его значит портить чтение карты.
+
 
 def _color(name, style="live"):
     return TOPO[name] if style == "topo" else COLORS[TYPE_ID[name]]
@@ -559,12 +568,13 @@ def paint(shapes, x0, y0, w_m, h_m, px_w, px_h, ss=SS, style="live", lines=None,
         elif sh.get("type") in TYPE_ID:
             by_type.setdefault(sh["type"], []).append(sh)
 
-    for name in vectormap.PRIORITY:
-        col = _color(name, style)
+    def draw_shapes(dd, name, col):
+        """Фигуры одного типа. Вынесено, потому что воду теперь рисуют дважды: сперва в маску,
+        потом ею же прозрачно поверх картинки."""
         for sh in by_type.get(name, ()):
             if sh["kind"] == "polygon":
                 if len(sh["points"]) >= 3:
-                    d.polygon([P(p) for p in sh["points"]], fill=col)
+                    dd.polygon([P(p) for p in sh["points"]], fill=col)
             elif sh["kind"] == "line":
                 w = max(1, int(round(float(sh.get("width_m", 8.0)) * sx)))
                 dash = sh.get("dash_m")
@@ -573,11 +583,25 @@ def paint(shapes, x0, y0, w_m, h_m, px_w, px_h, ss=SS, style="live", lines=None,
                 for run in runs:
                     if len(run) >= 2:
                         pts = [P(p) for p in run]
-                        d.line(pts, fill=col, width=w, joint="curve")
+                        dd.line(pts, fill=col, width=w, joint="curve")
                         if w > 2:                    # круглые торцы: без них штрих-пунктир рубленый
                             r = w / 2
                             for q in (pts[0], pts[-1]):
-                                d.ellipse([q[0] - r, q[1] - r, q[0] + r, q[1] + r], fill=col)
+                                dd.ellipse([q[0] - r, q[1] - r, q[0] + r, q[1] + r], fill=col)
+
+    see_through_water = style != "topo"
+    for name in vectormap.PRIORITY:
+        if name == "water" and see_through_water:
+            continue                      # воду кладём ниже, прозрачной, поверх уже нарисованного
+        draw_shapes(d, name, _color(name, style))
+
+    if see_through_water and by_type.get("water"):
+        # маска воды той же геометрией, что и заливка, — рисуем её белым в отдельный слой
+        wm = Image.new("L", img.size, 0)
+        draw_shapes(ImageDraw.Draw(wm), "water", 255)
+        tint = Image.new("RGB", img.size, _color("water", style))
+        img = Image.composite(Image.blend(img, tint, WATER_ALPHA), img, wm)
+        d = ImageDraw.Draw(img)           # композит вернул НОВУЮ картинку — рисуем дальше в неё
 
     # переправа пробивает воду — как и в сетке боя. Мост кладёт поверх дорогу, брод остаётся
     # бродом: он проходим, но медленный, и красить его дорогой значило бы врать про местность.

@@ -637,6 +637,33 @@ def main():
            f"{nm}: скорость {ct.speed_at(cv_mid):.2f} "
            f"({'быстрее' if fast else 'медленнее'} поля)")
 
+    # ВОДА В ЖИВОМ СТИЛЕ ПРОЗРАЧНАЯ. Сплошная заливка читалась как синяя лента поверх карты, а
+    # не как река. Прозрачность даёт и полезное: дорога рисуется раньше воды, поэтому под водой
+    # остаётся видна — там, где она уходит в реку и не выходит мостом, это сразу заметно.
+    # В топостиле вода СПЛОШНАЯ: голубая заливка там условный знак, размывать его нельзя.
+    import paint as wpaint  # noqa: E402
+    W_SZ = 1000.0
+    wet = [{"kind": "line", "type": "road", "width_m": 10.0,
+            "points": [[0, 500], [W_SZ, 500]]},
+           {"kind": "polygon", "type": "forest",
+            "points": [[0, 560], [W_SZ, 560], [W_SZ, 700], [0, 700]]},
+           {"kind": "line", "type": "water", "width_m": 120.0,
+            "points": [[500, 0], [500, W_SZ]]}]
+
+    def wet_at(img, wx, wy):
+        px = np.asarray(img)[int(wy / W_SZ * 255), int(wx / W_SZ * 255)]
+        return tuple(int(v) for v in px)          # без int вывод пестрит np.int64(...)
+
+    live_t = wpaint.paint(wet, 0.0, 0.0, W_SZ, W_SZ, 256, 256, style="live", ss=2)
+    topo_t = wpaint.paint(wet, 0.0, 0.0, W_SZ, W_SZ, 256, 256, style="topo", ss=2)
+    w_road, w_open = wet_at(live_t, 500, 500), wet_at(live_t, 500, 200)
+    w_col = tuple(int(v) for v in wpaint._color("water", "live"))
+    ok(w_road != w_open and all(abs(a - b) < 70 for a, b in zip(w_open, w_col)),
+       f"сквозь воду видно дно и это всё ещё вода: над дорогой {w_road}, "
+       f"над полем {w_open}, цвет воды {w_col}")
+    ok(wet_at(topo_t, 500, 500) == wet_at(topo_t, 500, 200),
+       "в топостиле вода сплошная — условный знак не размывается")
+
     # --- линейка
     # Значение снимаем ПОКА ДЕРЖИМ кнопку: линейка гаснет на отпускании (она измерение, а не
     # объект карты), и читать её после — значит читать пустоту.
