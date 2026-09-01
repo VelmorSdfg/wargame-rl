@@ -3994,6 +3994,34 @@ class EditorFrame(ttk.Frame):
             self.after_cancel(self._measure_job)
         self._measure_job = self.after(delay, self.remeasure)
 
+    def lost_buildings(self, surface, cell):
+        """Номера строений, которых в собранной сетке НЕТ ни одной клеткой.
+
+        Клетка становится зданием по доле покрытия, а у мелкого дома доля мала: замерено, что
+        ниже примерно 7x7 м строение при клетке 30 м пропадает совсем. И пропадает молча —
+        на чертеже дом есть, в объёме стоит коробкой, а бою не достаётся ничего. Тот же тихий
+        отказ, что был у мостов до того, как переправа стала назначать тип клетки.
+
+        Чинить это подгонкой размеров нельзя: заставь дом занимать клетку — сарай в 48 м²
+        станет блоком 30x30, а это ложь в другую сторону. Поэтому говорим прямо, а решает автор:
+        сделать дом крупнее или взять клетку мельче."""
+        bid = vectormap._types()["building"]
+        out = []
+        for i, sh in enumerate(self.doc.shapes):
+            if sh["kind"] != "building":
+                continue
+            cx, cy, bw, bh, ang = sh["rect_m"]
+            pts = vectormap._rect_points(cx, cy, bw, bh, ang)
+            xs = [q[0] for q in pts]
+            ys = [q[1] for q in pts]
+            x0 = int(np.clip(min(xs) / cell, 0, surface.shape[0] - 1))
+            x1 = int(np.clip(max(xs) / cell, 0, surface.shape[0] - 1))
+            y0 = int(np.clip(min(ys) / cell, 0, surface.shape[1] - 1))
+            y1 = int(np.clip(max(ys) / cell, 0, surface.shape[1] - 1))
+            if not (surface[x0:x1 + 1, y0:y1 + 1] == bid).any():
+                out.append(i)
+        return out
+
     def remeasure(self):
         """Замер по требованию (F5) — одной строкой в состоянии. Полная панель убрана из окна,
         сами числа никуда не делись: metrics хранится и доступен проверкам."""
@@ -4006,12 +4034,16 @@ class EditorFrame(ttk.Frame):
             cell = self.doc.cell_m
         surface, _ = self.doc.surface(cell)
         m = measure(surface, cell, n_pairs=400)
+        lost = self.lost_buildings(surface, cell)
+        m["lost_buildings"] = lost
         self.metrics = m
         self.status.config(
             text=f"сетка {surface.shape[0]}x{surface.shape[1]} по {cell:.0f} м · "
                  f"лес {m['frac'][1] * 100:.0f}% застр {m['frac'][2] * 100:.0f}% "
                  f"дор {m['frac'][4] * 100:.0f}% · видимость {m['vis'] * 100:.0f}% · "
                  f"строений {m['comps']} · "
+                 + (f"НЕ ДОЙДЁТ ДО БОЯ строений: {len(lost)} (мелкие — увеличьте или возьмите "
+                    f"клетку мельче) · " if lost else "")
                  + ("годна" if not m["bad"] else "вырождена: " + "; ".join(m["bad"])))
 
     # --- файлы
