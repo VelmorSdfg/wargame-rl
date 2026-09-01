@@ -42,6 +42,7 @@ import numpy as np
 import terrain
 
 SUB = 4                      # подвыборка при растеризации: клетка делится на SUB×SUB
+RELIEF_SMOOTH = 6            # проходов сглаживания поля высот: холм должен иметь склон, а не борт
 # Пороги доли покрытия клетки и приоритет. Дорога — САМАЯ слабая (кроме открытого): она тонкая,
 # порог у неё низкий, и пустить её вперёд леса значит стереть лес любой тропинкой.
 #
@@ -65,17 +66,44 @@ def new_doc(size_m, shapes=None):
 
 
 def load(path):
+    """Вектор плюс карта высот, если она есть рядом.
+
+    Старый формат, где рельеф лежал фигурами, переносится здесь же: фигуры один раз вдавливаются
+    в карту высот тем же кодом, что считал их раньше, и исчезают. Поэтому уже нарисованные карты
+    не меняются, а править их дальше можно кистями."""
     with open(path, "r", encoding="utf-8") as f:
         doc = json.load(f)
     if doc.get("version") != 1:
         raise ValueError(f"{path}: версия формата {doc.get('version')}, поддерживается 1")
+    hp = height_path(path)
+    if os.path.exists(hp):
+        z = np.load(hp)
+        doc["height"] = {"cell_m": float(z["cell_m"]), "h": np.asarray(z["h"], dtype=np.float32)}
+    elif any(sh.get("type") == "relief" for sh in doc["shapes"]):
+        # Клетку берём ТУ ЖЕ, в которой карта собиралась для боя. Тогда перенос точен до нуля:
+        # пересчёт из растра в ту же клетку — тождество. Возьми мельче — и рельеф чуть поедет
+        # (радиус сглаживания в старом коде зависел от размера сетки), а вместе с ним поедут
+        # линии огня: замер показал расхождение 4% пар видимости.
+        cell = _built_cell(path) or default_height_cell(doc["size_m"])
+        doc["height"] = {"cell_m": cell, "h": bake_relief(doc, cell)}
+        doc["shapes"] = [sh for sh in doc["shapes"] if sh.get("type") != "relief"]
     return doc
 
 
 def save(doc, path):
+    """Вектор в json, карту высот — в npz рядом. В json растру не место: это мегабайт чисел,
+    который человеку не читать, а diff по нему бесполезен."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    hm = doc.get("height")
+    plain = {k: v for k, v in doc.items() if k != "height"}
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(doc, f, ensure_ascii=False, indent=2)
+        json.dump(plain, f, ensure_ascii=False, indent=2)
+    hp = height_path(path)
+    if hm is not None and np.any(hm["h"]):
+        np.savez_compressed(hp, h=np.asarray(hm["h"], dtype=np.float32),
+                            cell_m=float(hm["cell_m"]))
+    elif os.path.exists(hp):
+        os.remove(hp)                      # рельеф стёрли — файл не должен остаться призраком
     return path
 
 
@@ -219,6 +247,16 @@ def dash_polyline(pts, on_m, off_m):
     return out
 
 
+def _box_blur(a):
+    """Три-на-три среднее без scipy: зависимость ради шести проходов тянуть незачем."""
+    out = a.copy()
+    out[1:] += a[:-1]; out[:-1] += a[1:]
+    out[:, 1:] += a[:, :-1]; out[:, :-1] += a[:, 1:]
+    out[1:, 1:] += a[:-1, :-1]; out[:-1, :-1] += a[1:, 1:]
+    out[1:, :-1] += a[:-1, 1:]; out[:-1, 1:] += a[1:, :-1]
+    return out / 9.0
+
+
 def _rect_points(cx, cy, w, h, angle_deg):
     a = math.radians(angle_deg)
     ca, sa = math.cos(a), math.sin(a)
@@ -227,6 +265,352 @@ def _rect_points(cx, cy, w, h, angle_deg):
         dx, dy = sx * w, sy * h
         out.append((cx + dx * ca - dy * sa, cy + dx * sa + dy * ca))
     return out
+
+
+def _fill_masks(doc, gx, gy, cell_m, to_px):
+    """Заливка фигур в маски по типам. Общая часть полной растеризации и оконной: разойдись они —
+    вблизи камеры карта была бы не та, что читает бой."""
+    px_m = cell_m / SUB
+    masks = {k: _blank(gx, gy) for k in THRESHOLDS}
+    buildings = []
+    for sh in doc["shapes"]:
+        kind = sh["kind"]
+        if sh.get("type") == "relief":
+            continue                      # рельеф — не материал, он собирается отдельно
+        if kind == "polygon":
+            _fill_polygon(masks[sh["type"]], [to_px(p) for p in sh["points"]])
+        elif kind == "line":
+            width_px = float(sh.get("width_m", cell_m)) / px_m
+            dash = sh.get("dash_m")               # [штрих, промежуток] в метрах
+            runs = (dash_polyline(sh["points"], dash[0], dash[1]) if dash else [sh["points"]])
+            for run in runs:
+                _fill_thick_line(masks[sh["type"]], [to_px(p) for p in run], width_px)
+        elif kind == "building":
+            cx, cy, w, h, ang = sh["rect_m"]
+            _fill_polygon(masks["building"], [to_px(p) for p in _rect_points(cx, cy, w, h, ang)])
+            buildings.append({"rect_m": list(sh["rect_m"]), "capacity": int(sh.get("capacity", 1))})
+        elif kind == "crossing":
+            pass                                          # обрабатывается отдельно, поверх воды
+        else:
+            raise ValueError(f"неизвестная фигура: {kind}")
+    return masks, buildings
+
+
+def _apply_crossings(doc, masks, gx, gy, to_px):
+    """Переправы пробивают воду. Без них река делит карту пополам, и половина местности
+    недостижима — самая частая ошибка при рисовании.
+
+    МОСТ кладёт поверх дорогу, БРОД — нет. Разница не косметическая: дорога у нас быстрее поля
+    (1.1 против 1.0, техника 1.5), а брод медленнее всего (0.45, техника 0.3). Пока брод считался
+    дорогой, переход реки вброд выходил быстрее, чем обход посуху, — то есть местность врала в
+    сторону, обратную здравому смыслу."""
+    for sh in doc["shapes"]:
+        if sh["kind"] != "crossing":
+            continue
+        (px_, py_), length, width, angle = crossing_geom(doc, sh)
+        hole = _blank(gx, gy)
+        _fill_polygon(hole, [to_px(q) for q in _rect_points(px_, py_, length, width, angle)])
+        masks["water"] &= ~hole
+        if not sh.get("ford"):
+            masks["road"] |= hole
+
+
+def _crossing_cells(doc, gx, gy, cell_m, y_top, want_ford=False, x_left=0.0):
+    """Клетки, которые занимает переправа, — их тип назначается ПОВЕРХ долевого спора.
+
+    Почему не долей покрытия, как у всего остального. Клетка имеет ОДИН тип, и тип берётся
+    по доле: вода занимает 30% клетки — клетка вода. Мост шириной восемь метров в клетке
+    тридцать метров занимает четверть и проигрывает всегда, сколько его ни рисуй. На театре
+    из-за этого 10 переправ из 12 выходили непроходимыми, а сеть дорог разрывалась пополам.
+    Спор тут неуместен: переправа для того и существует, чтобы объявить клетку проезжей.
+
+    И не растеризацией прямоугольника, а ШАГОМ ПО ОСИ моста. Подпиксель при клетке 30 м —
+    это 7.5 м, то есть мост шириной 8.4 м ложится в один подпиксель и местами промахивается
+    мимо их центров: одна переправа из двенадцати так и оставалась водой. Ход по оси даёт
+    непрерывную полосу клеток при любой ширине — а непрерывность здесь и есть весь смысл.
+
+    x_left/y_top — левый и верхний край СЕТКИ в мире. Верхний край был здесь с самого начала, а
+    левый подразумевался нулём — то есть считалось, что сетка всегда начинается от края карты.
+    Для полной растеризации это верно, для ОКНА нет: кусок начинается с произвольного x, и
+    переправа в нём съезжала на x0/клетку столбцов, а чаще просто выпадала за границы и
+    пропадала. В стиле «клетки боя» это значило, что мост есть в бою, но не показан на всех
+    кусках, кроме самого левого."""
+    out = None
+    for sh in doc["shapes"]:
+        if sh["kind"] != "crossing" or bool(sh.get("ford")) != want_ford:
+            continue
+        (cx, cy), length, width, angle = crossing_geom(doc, sh)
+        if out is None:
+            out = np.zeros((gy, gx), dtype=bool)
+        a = math.radians(angle)
+        ux, uy = math.cos(a), math.sin(a)             # вдоль моста, поперёк воды
+        step = cell_m * 0.4
+        n = max(2, int(length / step) + 1)
+        m = max(1, int(width / step) + 1)             # широкая дорога занимает не одну полосу
+        for i in range(n + 1):
+            t = -length / 2.0 + length * i / n
+            for k in range(m + 1):
+                q = -width / 2.0 + width * k / m
+                x = cx + ux * t - uy * q
+                y = cy + uy * t + ux * q
+                col = int((x - x_left) / cell_m)
+                row = int((y_top - y) / cell_m)
+                if 0 <= col < gx and 0 <= row < gy:
+                    out[row, col] = True
+    return out
+
+def _shape_bounds(sh):
+    """Габарит фигуры в метрах с запасом на толщину. Нужен, чтобы оконная растеризация не гоняла
+    все фигуры карты ради куска в полкилометра: на театре 10x10 км их сотни."""
+    if sh["kind"] == "polygon":
+        xs = [p[0] for p in sh["points"]]
+        ys = [p[1] for p in sh["points"]]
+        return min(xs), min(ys), max(xs), max(ys)
+    if sh["kind"] == "line":
+        r = float(sh.get("width_m", 8.0)) / 2 + 1.0
+        xs = [p[0] for p in sh["points"]]
+        ys = [p[1] for p in sh["points"]]
+        return min(xs) - r, min(ys) - r, max(xs) + r, max(ys) + r
+    if sh["kind"] == "building":
+        cx, cy, w, h, _ = sh["rect_m"]
+        r = math.hypot(w, h) / 2 + 1.0
+        return cx - r, cy - r, cx + r, cy + r
+    if sh["kind"] == "crossing":
+        r = float(sh.get("length_m") or 0.0) / 2 + float(sh.get("width_m", 30.0)) + 60.0
+        x, y = sh["point"]
+        return x - r, y - r, x + r, y + r
+    return -1e9, -1e9, 1e9, 1e9
+
+
+def surface_window(doc, cell_m, x0_m, y0_m, w_m, h_m):
+    """Сетка ТИПОВ для куска карты в мелкой клетке — то, что показывается вблизи камеры.
+
+    Высоту окно не считает нарочно. Сглаживание рельефа работает на всю карту сразу (радиус —
+    сотни метров), и посчитанное по куску не совпало бы с посчитанным по целой: на стыке кусков
+    земля бы ломалась. Высота берётся из общего поля с интерполяцией — она и так плавная. А
+    вблизи важна не она, а точность МЕСТНОСТИ: кромка леса, изгиб дороги, берег реки.
+
+    Переправы участвуют: без них мост в окне исчез бы, и река резала бы карту надвое."""
+    tid = _types()
+    gx, gy = max(1, int(round(w_m / cell_m))), max(1, int(round(h_m / cell_m)))
+    px_m = cell_m / SUB
+    top = y0_m + gy * cell_m
+    x1, y1 = x0_m + gx * cell_m, top
+
+    def to_px(p):
+        return ((p[0] - x0_m) / px_m, (top - p[1]) / px_m)
+
+    near = {"shapes": [sh for sh in doc["shapes"]
+                       if not (lambda b: b[2] < x0_m or b[0] > x1 or b[3] < y0_m or b[1] > y1)(
+                           _shape_bounds(sh))]}
+    masks, _ = _fill_masks(near, gx, gy, cell_m, to_px)
+    _apply_crossings(near, masks, gx, gy, to_px)
+
+    surf_img = np.full((gy, gx), tid["open"], dtype=np.int8)
+    for name in PRIORITY:
+        frac = masks[name].reshape(gy, SUB, gx, SUB).mean(axis=(1, 3))
+        surf_img[frac > THRESHOLDS[name]] = tid[name]
+    cross = _crossing_cells(near, gx, gy, cell_m, top, x_left=x0_m)
+    if cross is not None:
+        surf_img[cross] = tid["road"]        # то же, что и в полной растеризации: мост главнее
+    fords = _crossing_cells(near, gx, gy, cell_m, top, want_ford=True, x_left=x0_m)
+    if fords is not None:
+        surf_img[fords] = tid["ford"]
+    return np.ascontiguousarray(surf_img[::-1].T)
+
+
+# ---------------------------------------------------------------- карта высот
+#
+# Высота — РАСТРОВЫЙ слой карты, а не фигуры. Причина простая: лес и дорога это области с краем,
+# и край обязан быть точным на любом приближении — потому вектор. Высота же определена всюду и
+# гладкая, её «край» (обрыв) — редкий случай, и он выражается крутым уклоном. Фигурами высоту
+# рисовать можно (и удобно), но они ШТАМПЫ: вдавливаются в карту высот и перестают существовать
+# отдельно. Иначе получается два источника правды, а рельеф из складывающихся фигур не умеет
+# ни абсолютных отметок, ни обрыва, ни правки задним числом.
+#
+# Файл: <имя>.height.npz рядом с вектором, метры, [gx, gy], y вверх.
+
+HEIGHT_CELLS = (5.0, 10.0, 20.0, 40.0)   # кратны друг другу вдвое: на этом стоит сшивка уровней
+#                                          подробности в объёмном виде
+
+
+def default_height_cell(size_m):
+    """Клетка карты высот под размер карты: около пятисот точек на сторону, но из ряда кратных."""
+    want = max(float(size_m[0]), float(size_m[1])) / 512.0
+    return min(HEIGHT_CELLS, key=lambda c: abs(math.log(c / max(want, 1e-6))))
+
+
+def height_path(vector_path):
+    return vector_path[:-len(".vector.json")] + ".height.npz"
+
+
+def _built_cell(vector_path):
+    """Клетка, в которой карта уже собиралась для боя, если сборка рядом лежит."""
+    meta = vector_path[:-len(".vector.json")] + ".map.json"
+    if not os.path.exists(meta):
+        return None
+    try:
+        with open(meta, "r", encoding="utf-8") as f:
+            return float(json.load(f)["cell_m"])
+    except Exception:
+        return None
+
+
+def _resample(h, src_cell, gx, gy, dst_cell):
+    """Карта высот в другую клетку, билинейно. Отсчёт по центрам клеток: значение относится к
+    клетке целиком (так его читает бой), а не к узлу."""
+    sx, sy = h.shape
+    u = ((np.arange(gx) + 0.5) * dst_cell) / src_cell - 0.5
+    v = ((np.arange(gy) + 0.5) * dst_cell) / src_cell - 0.5
+    u = np.clip(u, 0, sx - 1)
+    v = np.clip(v, 0, sy - 1)
+    i0 = np.floor(u).astype(np.int32); i1 = np.minimum(i0 + 1, sx - 1); fu = (u - i0)[:, None]
+    j0 = np.floor(v).astype(np.int32); j1 = np.minimum(j0 + 1, sy - 1); fv = (v - j0)[None, :]
+    a = h[np.ix_(i0, j0)] * (1 - fu) + h[np.ix_(i1, j0)] * fu
+    b = h[np.ix_(i0, j1)] * (1 - fu) + h[np.ix_(i1, j1)] * fu
+    return np.ascontiguousarray(a * (1 - fv) + b * fv).astype(np.float32)
+
+
+def bake_relief(doc, cell_m):
+    """Фигуры рельефа -> поле высот в метрах, [gx, gy], y вверх.
+
+    Это ПЕРЕНОС старого формата, где рельеф жил фигурами: код тот же, чтобы уже нарисованные
+    карты не поехали. Новым картам эта дорога не нужна — они правятся кистями по растру."""
+    W, H = float(doc["size_m"][0]), float(doc["size_m"][1])
+    gx, gy = int(round(W / cell_m)), int(round(H / cell_m))
+    px_m = cell_m / SUB
+
+    def to_px(p):
+        return (p[0] / px_m, (H - p[1]) / px_m)
+
+    img = np.zeros((gy * SUB, gx * SUB), dtype=np.float32)
+    for sh in doc["shapes"]:
+        if sh.get("type") != "relief":
+            continue
+        m = _blank(gx, gy)
+        if sh["kind"] == "polygon":
+            _fill_polygon(m, [to_px(p) for p in sh["points"]])
+        elif sh["kind"] == "line":
+            _fill_thick_line(m, [to_px(p) for p in sh["points"]],
+                             float(sh.get("width_m", 200.0)) / px_m)
+        else:
+            continue
+        img += m.astype(np.float32) * float(sh.get("h_m", 20.0))
+    cells = img.reshape(gy, SUB, gx, SUB).mean(axis=(1, 3)).astype(np.float32)
+    if not cells.any():
+        return np.zeros((gx, gy), dtype=np.float32)
+    # Склон должен быть длиной с сам холм. Коротким размытием этого не добиться: выходит плита с
+    # отвесными бортами. Идём пирамидой — ужимаем поле в восемь раз, там сглаживаем и растягиваем
+    # обратно бикубикой. Радиус сглаживания становится сотнями метров при той же цене.
+    from PIL import Image as _I
+    small = _I.fromarray(cells, mode="F").resize((max(3, gx // 8), max(3, gy // 8)), _I.BILINEAR)
+    wide = np.asarray(small.resize((gx, gy), _I.BICUBIC), dtype=np.float32)
+    near = cells.copy()
+    for _ in range(RELIEF_SMOOTH):
+        near = _box_blur(near)
+    return np.ascontiguousarray((0.75 * wide + 0.25 * near)[::-1].T).astype(np.float32)
+
+
+def sample_height(hm, X, Y):
+    """Высота карты в произвольных точках мира, билинейно. X, Y — массивы метров."""
+    h = np.asarray(hm["h"], dtype=np.float32)
+    c = float(hm["cell_m"])
+    sx, sy = h.shape
+    u = np.clip(np.asarray(X, dtype=np.float32) / c - 0.5, 0, sx - 1)
+    v = np.clip(np.asarray(Y, dtype=np.float32) / c - 0.5, 0, sy - 1)
+    i0 = np.floor(u).astype(np.int32); i1 = np.minimum(i0 + 1, sx - 1); fu = u - i0
+    j0 = np.floor(v).astype(np.int32); j1 = np.minimum(j0 + 1, sy - 1); fv = v - j0
+    a = h[i0, j0] * (1 - fu) + h[i1, j0] * fu
+    b = h[i0, j1] * (1 - fu) + h[i1, j1] * fu
+    return (a * (1 - fv) + b * fv).astype(np.float32)
+
+
+def absorb_relief(doc, cell_m=None):
+    """Вдавить фигуры рельефа в карту высот и убрать их из вектора.
+
+    Это и есть «штамп» из гибридной схемы: рисовать фигурами удобно, но жить они не должны —
+    два источника правды на одну высоту означают, что правка одного молча расходится с другим."""
+    if not any(sh.get("type") == "relief" for sh in doc["shapes"]):
+        return doc
+    cell = float(cell_m or default_height_cell(doc["size_m"]))
+    add = bake_relief(doc, cell)
+    hm = doc.get("height")
+    if hm is None or float(hm["cell_m"]) != cell:
+        base = (np.zeros_like(add) if hm is None
+                else _resample(np.asarray(hm["h"], dtype=np.float32), float(hm["cell_m"]),
+                               add.shape[0], add.shape[1], cell))
+        doc["height"] = {"cell_m": cell, "h": (base + add).astype(np.float32)}
+    else:
+        doc["height"] = {"cell_m": cell, "h": (np.asarray(hm["h"], np.float32) + add)}
+    doc["shapes"] = [sh for sh in doc["shapes"] if sh.get("type") != "relief"]
+    return doc
+
+
+def _wide_blur(a, r):
+    """Размытие радиусом r клеток тремя проходами скользящего среднего.
+
+    Своё, а не из PIL: тамошнее гауссово не берёт вещественные картинки (mode F), а гонять
+    высоту через восемь бит значило бы округлять метры до четверти."""
+    r = int(max(1, round(r * 0.55)))
+    k = 2 * r + 1
+    for _ in range(3):
+        pad = np.pad(a, ((r + 1, r), (0, 0)), mode="edge")
+        c = np.cumsum(pad, axis=0)
+        a = (c[k:] - c[:-k]) / k
+        pad = np.pad(a, ((0, 0), (r + 1, r)), mode="edge")
+        c = np.cumsum(pad, axis=1)
+        a = (c[:, k:] - c[:, :-k]) / k
+    return a.astype(np.float32)
+
+
+def stamp(doc, shapes, cell_m=None, slope_m=150.0, absolute=False):
+    """Вдавить фигуры в карту высот: полигон — холм или котловина, линия — гряда или лощина.
+
+    Склон СВОЙ у каждого штампа и задаётся в метрах, а не выводится из размера карты. Старый
+    рельеф сглаживался пирамидой с радиусом в восьмую карты, из-за чего одна и та же нарисованная
+    гряда давала разный холм на карте 2.5 км и на 10 км, а обрыв нарисовать было нечем вовсе.
+
+    absolute — не прибавить, а ВЫРОВНЯТЬ до отметки: так делаются плато, дно карьера, терраса."""
+    hm = doc.get("height")
+    cell = float(cell_m or (hm and hm["cell_m"]) or default_height_cell(doc["size_m"]))
+    W, H = float(doc["size_m"][0]), float(doc["size_m"][1])
+    gx, gy = max(1, int(round(W / cell))), max(1, int(round(H / cell)))
+    if hm is None:
+        cur = np.zeros((gx, gy), dtype=np.float32)
+    else:
+        cur = _resample(np.asarray(hm["h"], np.float32), float(hm["cell_m"]), gx, gy, cell)
+    px_m = cell / SUB
+
+    def to_px(p):
+        return (p[0] / px_m, (H - p[1]) / px_m)
+
+    for sh in shapes:
+        m = _blank(gx, gy)
+        if sh["kind"] == "polygon":
+            _fill_polygon(m, [to_px(p) for p in sh["points"]])
+        elif sh["kind"] == "line":
+            _fill_thick_line(m, [to_px(p) for p in sh["points"]],
+                             float(sh.get("width_m", 200.0)) / px_m)
+        else:
+            continue
+        cells = m.reshape(gy, SUB, gx, SUB).mean(axis=(1, 3)).astype(np.float32)
+        blur = _wide_blur(cells, max(0.5, float(slope_m) / cell))
+        # Растяжка после размытия возвращает штампу плоскую вершину: без неё узкая гряда шириной
+        # с радиус склона проседает вдвое и высота в панели перестаёт значить хоть что-то.
+        w = np.clip((blur - 0.25) / 0.5, 0.0, 1.0)
+        w = np.ascontiguousarray(w[::-1].T)
+        h_m = float(sh.get("h_m", 20.0))
+        cur = cur * (1 - w) + h_m * w if absolute else cur + h_m * w
+    doc["height"] = {"cell_m": cell, "h": cur.astype(np.float32)}
+    return doc
+
+
+def height_field(doc, gx, gy, cell_m):
+    """Поле высот карты под запрошенную сетку, метры, [gx, gy], y вверх."""
+    hm = doc.get("height")
+    if hm is None:
+        return bake_relief(doc, cell_m)
+    return _resample(np.asarray(hm["h"], dtype=np.float32), float(hm["cell_m"]), gx, gy, cell_m)
 
 
 def rasterize(doc, cell_m):
@@ -243,37 +627,14 @@ def rasterize(doc, cell_m):
     def to_px(p):
         return (p[0] / px_m, (H - p[1]) / px_m)           # y вниз для растеризации
 
-    masks = {k: _blank(gx, gy) for k in THRESHOLDS}
-    buildings = []
-    for sh in doc["shapes"]:
-        kind = sh["kind"]
-        if kind == "polygon":
-            _fill_polygon(masks[sh["type"]], [to_px(p) for p in sh["points"]])
-        elif kind == "line":
-            width_px = float(sh.get("width_m", cell_m)) / px_m
-            dash = sh.get("dash_m")               # [штрих, промежуток] в метрах
-            runs = (dash_polyline(sh["points"], dash[0], dash[1]) if dash else [sh["points"]])
-            for run in runs:
-                _fill_thick_line(masks[sh["type"]], [to_px(p) for p in run], width_px)
-        elif kind == "building":
-            cx, cy, w, h, ang = sh["rect_m"]
-            _fill_polygon(masks["building"], [to_px(p) for p in _rect_points(cx, cy, w, h, ang)])
-            buildings.append({"rect_m": list(sh["rect_m"]), "capacity": int(sh.get("capacity", 1))})
-        elif kind == "crossing":
-            pass                                          # обрабатывается ниже, поверх воды
-        else:
-            raise ValueError(f"неизвестная фигура: {kind}")
+    masks, buildings = _fill_masks(doc, gx, gy, cell_m, to_px)
 
-    # переправы: мост или брод пробивает воду и кладёт поверх дорогу. Без них река делит карту
-    # пополам, и половина местности недостижима — самая частая ошибка при рисовании.
-    for sh in doc["shapes"]:
-        if sh["kind"] != "crossing":
-            continue
-        (px_, py_), length, width, angle = crossing_geom(doc, sh)
-        hole = _blank(gx, gy)
-        _fill_polygon(hole, [to_px(q) for q in _rect_points(px_, py_, length, width, angle)])
-        masks["water"] &= ~hole
-        masks["road"] |= hole
+    # РЕЛЬЕФ берётся из карты высот — отдельного растрового слоя карты (см. height_field).
+    # Отдельным полем, а не типом клетки: высота — величина, а не материал, и на одной и той же
+    # высоте бывает и лес, и поле.
+    height_cell = height_field(doc, gx, gy, cell_m)
+
+    _apply_crossings(doc, masks, gx, gy, to_px)
 
     # доля покрытия клетки: подпиксели SUB×SUB сворачиваются усреднением
     def frac(mask):
@@ -282,6 +643,12 @@ def rasterize(doc, cell_m):
     surf_img = np.full((gy, gx), tid["open"], dtype=np.int8)
     for name in PRIORITY:
         surf_img[frac(masks[name]) > THRESHOLDS[name]] = tid[name]
+    cross = _crossing_cells(doc, gx, gy, cell_m, H)
+    if cross is not None:
+        surf_img[cross] = tid["road"]                     # мост главнее всех, даже застройки
+    fords = _crossing_cells(doc, gx, gy, cell_m, H, want_ford=True)
+    if fords is not None:
+        surf_img[fords] = tid["ford"]                     # брод так же главнее спора, но он не дорога
     surface = np.ascontiguousarray(surf_img[::-1].T)      # -> [gx, gy], y вверх
 
     # дома — ОБЪЕКТЫ: компоненты известны из вектора, искать связные пятна клеток не нужно
@@ -311,6 +678,8 @@ def rasterize(doc, cell_m):
             capacity[int(base + k)] = 1
 
     fields = terrain.fields_from_surface(surface)
+    if height_cell is not None and height_cell.any():
+        fields["height"] = np.ascontiguousarray(height_cell).astype(np.float32)
 
     # ДОРОГА ПОД ЛЕСОМ. У клетки один тип, и на пересечении лес побеждает дорогу — иначе любая
     # тропинка стирала бы массив. Но в жизни просека это и укрытие, и быстрый ход одновременно,
@@ -450,7 +819,75 @@ def crop(doc, center_m, size_m, angle_deg=0.0):
             if 0 <= nx <= w and 0 <= ny <= h:
                 shapes.append({"kind": "crossing", "point": [round(nx, 1), round(ny, 1)],
                                "width_m": sh.get("width_m", 30.0)})
-    return new_doc((w, h), shapes)
+    out = new_doc((w, h), shapes)
+
+    # Взорванные мосты крой уносит вместе с фигурами. Иначе вырезка из театра молча ставила бы
+    # снесённый мост обратно: точки сноса остались бы в источнике, а боевая карта собралась бы
+    # с чистого листа — и замысел «переправа взорвана» пропадал бы ровно там, где по нему играют.
+    blown = []
+    for q in doc.get("blown", ()):
+        nx, ny = T(q)
+        if 0 <= nx <= w and 0 <= ny <= h:
+            blown.append([round(nx, 1), round(ny, 1)])
+    if blown:
+        out["blown"] = blown
+
+    # Высоту крой тоже уносит: без неё вырезанная боевая карта оказывалась плоской, хотя её
+    # рисовали в горах. Растр пересэмплируется с поворотом — тем же преобразованием, что и фигуры.
+    hm = doc.get("height")
+    if hm is not None and np.any(hm["h"]):
+        c = float(hm["cell_m"])
+        gx, gy = max(1, int(round(w / c))), max(1, int(round(h / c)))
+        ux = (np.arange(gx) + 0.5) * c - w / 2
+        vy = (np.arange(gy) + 0.5) * c - h / 2
+        U, V = np.meshgrid(ux, vy, indexing="ij")
+        X = cx + U * ca + V * sa                    # обратный поворот: матрица ортогональна
+        Y = cy - U * sa + V * ca
+        out["height"] = {"cell_m": c, "h": sample_height(hm, X, Y)}
+    return out
+
+
+def line_hits(a_pts, b_pts):
+    """Точки пересечения двух ломаных."""
+    out = []
+    for a0, a1 in zip(a_pts[:-1], a_pts[1:]):
+        for b0, b1 in zip(b_pts[:-1], b_pts[1:]):
+            hit = _seg_intersect(a0, a1, b0, b1)
+            if hit:
+                out.append(hit[0])
+    return out
+
+
+def crossing_gaps(doc, tol_m=60.0, only=None):
+    """Пересечения дороги с водой, где переправы НЕТ.
+
+    Дорога через реку без переправы не работает: у клетки один тип, вода перекрывает дорогу, и
+    берег остаётся берегом. На вид при этом всё нарисовано — дорога входит в реку и выходит с
+    той стороны, — поэтому промах и не замечается, пока карта не окажется разрезанной пополам.
+
+    only — список фигур, которыми интересуемся (только что нарисованная линия): тогда ищем
+    пересечения лишь с ней, а не по всей карте.
+
+    ВЗОРВАННЫЙ МОСТ не считается пробелом. Удалить переправу — это осмысленное действие («мост
+    взорван»), и точка сноса помнится в doc["blown"]. Без этого пересчёт после правки воскрешал
+    бы снесённый мост, стоило подвинуть рядом дорогу, — то есть отменял бы решение молча.
+
+    Видит только ЛИНИИ: озеро полигоном через дорогу здесь не найдётся. Сейчас воды-полигонов
+    в картах нет ни одной, поэтому и не усложняем."""
+    roads = [sh for sh in doc["shapes"] if sh["kind"] == "line" and sh.get("type") == "road"]
+    waters = [sh for sh in doc["shapes"] if sh["kind"] == "line" and sh.get("type") == "water"]
+    have = [sh["point"] for sh in doc["shapes"] if sh["kind"] == "crossing"]
+    have += [list(p) for p in doc.get("blown", ())]
+    out = []
+    for r in roads:
+        for w in waters:
+            if only is not None and r not in only and w not in only:
+                continue
+            for p in line_hits(r["points"], w["points"]):
+                if any(math.hypot(p[0] - q[0], p[1] - q[1]) < tol_m for q in have + out):
+                    continue
+                out.append([round(float(p[0]), 1), round(float(p[1]), 1)])
+    return out
 
 
 # ---------------------------------------------------------------- граф дорог
@@ -592,7 +1029,10 @@ def load_map(prefix, m_per_unit):
     with open(prefix + ".map.json", "r", encoding="utf-8") as f:
         meta = json.load(f)
     z = np.load(prefix + ".fields.npz")
-    fields = {k: z[k] for k in terrain.FIELDS}
+    fields = {k: z[k] for k in terrain.FIELDS if k in z}
+    # высота лежит в МЕТРАХ (как всё в векторе), а бой считает в игровых единицах — иначе
+    # холм в 30 м оказался бы выше карты в пятнадцать раз
+    fields["height"] = np.asarray(fields.get("height", 0.0), dtype=np.float32) / m_per_unit
     cap = {int(k): v for k, v in meta.get("building_capacity", {}).items()}
     tm = terrain.from_fields(z["surface"], fields, meta["cell_m"] / m_per_unit, cap, z["building_comp"])
     return tm, meta

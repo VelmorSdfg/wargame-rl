@@ -817,11 +817,18 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--zones", type=int, default=3)
     ap.add_argument("--fixed-maps", action="store_true", help="реальные вырезки maps/platoon_crop_*")
+    ap.add_argument("--map", default=None,
+                    help="конкретная карта из maps/ по имени: и векторная (battle_21), и старая вырезка")
     ap.add_argument("--fps", type=int, default=30)
     args = ap.parse_args()
 
     fixed = []
-    if args.fixed_maps:
+    if args.map:
+        # одна названная карта. Среда сама разберётся, что это: рядом лежат собранные поля —
+        # берёт их, иначе читает старую сетку .npy
+        fixed = [os.path.join(wargame_env.project_dir(), "maps", args.map)]
+        print(f"карта: {args.map}")
+    elif args.fixed_maps:
         import glob
         fixed = sorted(p[:-4] for p in glob.glob(
             os.path.join(wargame_env.project_dir(), "maps", "platoon_crop_*.npy")))

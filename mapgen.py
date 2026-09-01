@@ -1,9 +1,18 @@
 """Генератор местности в векторе и нарезка из него боевых карт.
 
 Порядок рисования тут не произвольный, а тот, которым местность и складывается в природе:
-сначала вода, потом дороги по удобному с переправами через воду, потом сёла в узлах дорог,
-и только потом лес — на том, что осталось неудобным. Карта, начатая с леса, выходит кашей:
-пятна не объясняются ничем, дороги их обходят как попало, и на глаз это сразу видно.
+сначала РЕЛЬЕФ, потом вода — по спуску, а не наискось по линейке, потом дороги с переправами,
+потом сёла в узлах дорог, и только потом лес — на том, что осталось неудобным. Карта, начатая
+с леса, выходит кашей: пятна не объясняются ничем, дороги их обходят как попало.
+
+ИЕРАРХИЯ МАСШТАБОВ. Прежний генератор раскладывал всё одного размера, и большая карта выходила
+маленькой, повторённой шестнадцать раз: на театре 100 км² было 0.6 здания на км² четырнадцатью
+одинаковыми хуторами, лес одного радиуса и размах высот 97 м — тот же, что на карте вчетверо
+меньшей. Теперь у каждого слоя свои размеры (замер на 10 км против прежнего):
+
+    фигур на км²   2.6 -> 5.0        здания на км²   0.6 -> 3.1
+    ширины дорог   7-12 м -> 5-16    радиус леса     98-344 м -> 126-1200 м
+    размах высот   104 м -> 155 м    видимость       45% -> 39% (окно пула 25-85%)
 
 Второй смысл файла — нарезка. Один нарисованный театр даёт сколько угодно боевых карт:
 случайное место, случайный угол, зеркало. Вектор режется под любым углом без лесенки, а каждый
@@ -81,61 +90,221 @@ def _clamp_pts(pts, size):
 # ---------------------------------------------------------------- генерация
 
 
+def _fractal(rng, n, octaves=6, persist=0.52, ridged=False):
+    """Фрактальное поле 0..1: сумма октав шума, каждая вдвое мельче и вдвое слабее.
+
+    Так устроен настоящий рельеф — крупные массивы, на них складки, на складках мелочь. Одна
+    октава даёт гладкий бугор, и карта любого размера выглядит одинаково пустой."""
+    from PIL import Image as _I
+    out = np.zeros((n, n), dtype=np.float32)
+    amp, total, size = 1.0, 0.0, 2
+    for _ in range(octaves):
+        g = rng.random((size + 1, size + 1)).astype(np.float32)
+        up = np.asarray(_I.fromarray(g).resize((n, n), _I.BICUBIC), dtype=np.float32)
+        if ridged:
+            up = 1.0 - np.abs(2.0 * up - 1.0)     # гребни вместо холмов: острее и «горнее»
+        out += up * amp
+        total += amp
+        amp *= persist
+        size *= 2
+    out /= max(total, 1e-6)
+    lo, hi = float(out.min()), float(out.max())
+    return (out - lo) / max(hi - lo, 1e-6)
+
+
+def _relief_field(rng, S, cell):
+    """Поле высот карты. Размах растёт с размером: на 10 км это сотни метров, на боевой карте
+    десятки. Раньше он был один и тот же (97 м и там, и там), и театр читался столом."""
+    n = max(32, int(round(S / cell)))
+    # Число октав считается от РАЗМЕРА КАРТЫ так, чтобы самая мелкая складка была около двухсот
+    # метров на любой карте. С постоянным числом октав на боевой карте появлялась рябь с шагом
+    # в сорок метров — это не рельеф, а шум, и он рубил видимость до 13% при норме пула 25-85%.
+    oct_base = int(np.clip(round(math.log(max(S / 200.0, 2.0), 2)), 3, 7))
+    base = _fractal(rng, n, octaves=oct_base, persist=0.55)
+    ridge = _fractal(rng, n, octaves=max(2, oct_base - 2), persist=0.5, ridged=True)
+    field = 0.75 * base + 0.25 * ridge
+    field = field - float(field.mean())
+    # Задаём РАЗМАХ, а не множитель: у фрактала он от затравки пляшет вдвое, и карта то горная,
+    # то плоская. Двадцать метров на километр плюс сорок — обычная холмистая местность:
+    # 2.5 км -> ~56 м, 10 км -> ~165 м.
+    # Подобрано замером видимости, а не на глаз: при размахе 96 м на боевой карте она падала до
+    # 13% при норме пула 25-85% — рельеф закрывал всё. Двенадцать метров на километр плюс
+    # двадцать пять дают 33% на боевой карте и 34% на театре.
+    target = 0.012 * S + 25.0
+    span = float(field.max() - field.min()) or 1.0
+    return (field * (target / span)).astype(np.float32)
+
+
+def _fill_pits(h, eps=0.02, rounds=300):
+    """Залить замкнутые понижения — то, что вода сделала бы сама.
+
+    Без этого жадный спуск застревает в котловине и часами бродит по ней кругами: на театре
+    выходило русло в пятьдесят километров при диагонали в четырнадцать. На залитой поверхности
+    спуск монотонен, и река идёт от истока к краю без петель.
+
+    Способ обычный для гидрологии: начинаем с «воды по горлышко» всюду, кроме краёв, и
+    итерациями опускаем уровень до максимума из собственной высоты и минимума соседей."""
+    w = np.full_like(h, float(h.max()) + 1000.0)
+    w[0, :] = h[0, :]
+    w[-1, :] = h[-1, :]
+    w[:, 0] = h[:, 0]
+    w[:, -1] = h[:, -1]
+    for _ in range(rounds):
+        nb = np.full_like(w, np.inf)
+        nb[1:, :] = np.minimum(nb[1:, :], w[:-1, :])
+        nb[:-1, :] = np.minimum(nb[:-1, :], w[1:, :])
+        nb[:, 1:] = np.minimum(nb[:, 1:], w[:, :-1])
+        nb[:, :-1] = np.minimum(nb[:, :-1], w[:, 1:])
+        new = np.maximum(h, np.minimum(w, nb + eps))
+        if np.max(np.abs(new - w)) < 1e-3:
+            w = new
+            break
+        w = new
+    return w
+
+
+def _river_by_descent(height, cell, rng, max_steps=4000):
+    """Русло по СПУСКУ, а не наискось через карту.
+
+    Река, проведённая по линейке, лезет через гребни, и рельеф перестаёт что-либо объяснять.
+    Здесь она идёт из высокого места вниз по склону, а из ям выбирается подъёмом уровня — так
+    же, как настоящая вода заполняет котловину и переливается через край."""
+    n, m = height.shape
+    h = _fill_pits(height)                         # по залитой поверхности спуск монотонен
+    # Исток — в верхней четверти высот и В СЕРЕДИНЕ карты: взятый у края, он через три шага
+    # утыкается в границу, и реки не получается вовсе (замер: русло в 100 метров).
+    lo_i, hi_i = int(n * 0.2), int(n * 0.8)
+    lo_j, hi_j = int(m * 0.2), int(m * 0.8)
+    inner = h[lo_i:hi_i, lo_j:hi_j]
+    thr = float(np.percentile(inner, 88))
+    cand = np.argwhere(inner >= thr) + (lo_i, lo_j)
+    i, j = cand[int(rng.integers(0, len(cand)))]
+    path = [(i, j)]
+    pdi = pdj = 0                                  # прошлый шаг: по нему идёт инерция
+    for _ in range(max_steps):
+        score, bh, bi, bj = None, 0.0, i, j
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                if di == 0 and dj == 0:
+                    continue
+                ni, nj = i + di, j + dj
+                if not (0 <= ni < n and 0 <= nj < m):
+                    return path                    # дошли до края карты — устье
+                # Инерция: продолжать в ту же сторону дешевле. Без неё жадный спуск петляет,
+                # и на карте 10 км выходит русло в сорок километров — вчетверо длиннее диагонали.
+                keep = 0.30 if (di == pdi and dj == pdj) else 0.0
+                v = h[ni, nj] + rng.uniform(0.0, 0.10) - keep
+                if score is None or v < score:
+                    score, bh, bi, bj = v, h[ni, nj], ni, nj
+        pdi, pdj = bi - i, bj - j
+        if bh >= h[i, j]:
+            # Яма: поднимаем уровень заметным шагом. Сравниваем ЧИСТЫЕ высоты, а не оценку с
+            # инерцией, — иначе «застрял» срабатывает на каждом шагу, вода заливает всю округу
+            # и русло начинает бродить кругами.
+            h[i, j] = bh + 0.5
+        i, j = bi, bj
+        path.append((i, j))
+        if i <= 0 or j <= 0 or i >= n - 1 or j >= m - 1:
+            return path
+    # ходы кончились — выводим к ближайшему краю по прямой, чтобы река не обрывалась в поле
+    ei = 0 if i < n - 1 - i else n - 1
+    ej = 0 if j < m - 1 - j else m - 1
+    if abs(i - ei) < abs(j - ej):
+        path += [(int(i + (ei - i) * t), j) for t in np.linspace(0.1, 1.0, 12)]
+    else:
+        path += [(i, int(j + (ej - j) * t)) for t in np.linspace(0.1, 1.0, 12)]
+    return path
+
+
+def _thin_path(path, cell, min_step_m=90.0, smooth=2):
+    """Проредить ломаную и сгладить углы.
+
+    Спуск идёт по клеткам восемью направлениями, поэтому русло получается с изломами по 45
+    градусов — на карте это читается как ломаная, а не как река. Пара проходов скользящего
+    среднего по узлам убирает излом, оставляя форму."""
+    out = [path[0]]
+    for p in path[1:]:
+        if math.hypot((p[0] - out[-1][0]) * cell, (p[1] - out[-1][1]) * cell) >= min_step_m:
+            out.append(p)
+    if out[-1] != path[-1]:
+        out.append(path[-1])
+    pts = [[float(i * cell), float(j * cell)] for i, j in out]
+    for _ in range(smooth):
+        if len(pts) < 3:
+            break
+        pts = ([pts[0]]
+               + [[(a[0] + 2 * b[0] + c[0]) / 4.0, (a[1] + 2 * b[1] + c[1]) / 4.0]
+                  for a, b, c in zip(pts, pts[1:], pts[2:])]
+               + [pts[-1]])
+    return [[round(x, 1), round(y, 1)] for x, y in pts]
+
+
 def generate(size_m=2550.0, seed=0, battle_edges=True):
-    """Вектор местности. battle_edges: держать полосы развёртывания (300 м от нижнего и
-    верхнего края) чистыми — иначе тот, кто там начинает, стартует в готовой крепости."""
+    """Вектор местности плюс карта высот. battle_edges: держать полосы развёртывания (300 м от
+    нижнего и верхнего края) чистыми — иначе тот, кто там начинает, стартует в готовой крепости.
+
+    ИЕРАРХИЯ МАСШТАБОВ — главное здесь. Прежний генератор задавал плотности на км² и раскладывал
+    всё одного размера: четырнадцать сёл по четыре дома, сотня одинаковых лесков, три холма и
+    размах высот 97 метров что на 2.5 км, что на 10. Из-за этого большая карта была маленькой,
+    повторённой шестнадцать раз, и десять километров ощущались как два с половиной. Теперь у
+    каждого слоя свои размеры: город против хутора, магистраль против просёлка, лесной массив
+    против рощи, а размах высот растёт с размером карты."""
     rng = np.random.default_rng(seed)
     S = float(size_m)
     shapes = []
-
-    # ПЛОТНОСТИ, А НЕ ЧИСЛА. Первый вариант задавал «пять дорог и два села» — на боевой карте
-    # выходило похоже, а на десятикилометровом театре всё растворялось: вырезки ловили 0-2%
-    # дорог и ни одного дома при норме пула 7% и 3%. Размеры пятен по той же причине абсолютные:
-    # лес долей от карты давал на театре массивы по километру, и кусок целиком попадал внутрь.
     area_km2 = (S / 1000.0) ** 2
-    n_long = max(1, int(round(S / 1000.0 / 2.2)))          # продольная дорога каждые ~2.2 км
-    n_cross = max(2, int(round(S / 1000.0 / 1.8)))         # поперечная каждые ~1.8 км
-    n_villages = max(1, int(round(area_km2 / 7.0)))        # село на ~7 км²
-    n_forest = max(3, int(round(area_km2 * rng.uniform(0.8, 1.4))))
-    n_hedge = max(2, int(round(area_km2 * 0.7)))
-    FOREST_R = (120.0, 340.0)                              # радиус массива, МЕТРЫ
-    ROAD_KEEPOUT = 150.0                                   # лес не лезет вплотную к дороге
+    band = 300.0 if battle_edges else 0.0
+    cell = vectormap.default_height_cell((S, S))
 
-    # 1. ВОДА — одна ось наискось. Она диктует всё остальное: где трудно, где переправы.
-    side = rng.integers(0, 2)
-    if side == 0:
-        a, b = (rng.uniform(0, S * 0.35), S), (rng.uniform(S * 0.65, S), 0)
-    else:
-        a, b = (rng.uniform(0, S * 0.35), 0), (rng.uniform(S * 0.65, S), S)
-    river = _clamp_pts(_wander(rng, a, b, 7, S * 0.05), S)
-    river_w = float(rng.uniform(0.010, 0.022) * S)
+    # 1. РЕЛЬЕФ ПЕРВЫМ. Раньше он шёл последним и подгонялся под уже нарисованную реку; теперь
+    # наоборот — вода ищет низину в готовом рельефе, как и положено.
+    height = _relief_field(rng, S, cell)
+
+    # 2. ВОДА ПО СПУСКУ. Река, проведённая наискось по линейке, лезет через гребни, и рельеф
+    # перестаёт что-либо объяснять. Здесь она течёт вниз по склону от истока к краю карты.
+    river = _clamp_pts(_thin_path(_river_by_descent(height, cell, rng), cell), S)
+    river_w = float(np.clip(0.006 * S, 12.0, 90.0))       # на театре река шире, чем на поле боя
     shapes.append({"kind": "line", "type": "water", "width_m": round(river_w, 1),
                    "points": river})
 
-    # 2. ДОРОГИ. Одна вдоль долины, две-три поперёк — они и пересекут реку.
+    # 3. ДОРОГИ ИЕРАРХИЕЙ: магистраль, районные, улицы города. Раньше все были одной ширины, и
+    # десять километров дорожной сети выглядели как одна дорога, размноженная копиями.
     roads = []
+
+    def add_road(pts, width):
+        roads.append(pts)
+        shapes.append({"kind": "line", "type": "road", "width_m": round(float(width), 1),
+                       "points": pts})
+
+    n_main = 1 if S < 6000 else 2
+    for k in range(n_main):
+        t = (k + 0.5) / n_main
+        if rng.random() < 0.5:
+            p0, p1 = [0.0, t * S], [S, float(np.clip(t * S + rng.uniform(-0.2, 0.2) * S, 0, S))]
+        else:
+            p0, p1 = [t * S, 0.0], [float(np.clip(t * S + rng.uniform(-0.2, 0.2) * S, 0, S)), S]
+        add_road(_clamp_pts(_wander(rng, p0, p1, 5, S * 0.02), S), rng.uniform(14, 18))
+
+    n_long = max(1, int(round(S / 1000.0 / 2.6)))
+    n_cross = max(2, int(round(S / 1000.0 / 2.0)))
     rd = np.array(river[-1]) - np.array(river[0])
     ang = math.atan2(rd[1], rd[0])
-    for k in range(n_long):                                   # продольные
-        # разносим по ширине, а не бросаем случайно: две дороги в одном месте — это одна дорога
+    for k in range(n_long):
         frac = (k + 0.5) / n_long - 0.5
         off = frac * 1.6 * S + rng.uniform(-0.05, 0.05) * S
         px, py = -math.sin(ang) * off, math.cos(ang) * off
         p0 = [float(np.clip(river[0][0] + px, 0, S)), float(np.clip(river[0][1] + py, 0, S))]
         p1 = [float(np.clip(river[-1][0] + px, 0, S)), float(np.clip(river[-1][1] + py, 0, S))]
-        roads.append(_clamp_pts(_wander(rng, p0, p1, 6, S * 0.03), S))
-    for k in range(n_cross):                                  # поперечные
+        add_road(_clamp_pts(_wander(rng, p0, p1, 6, S * 0.03), S), rng.uniform(8, 11))
+    for k in range(n_cross):
         t = (k + 0.5 + rng.uniform(-0.15, 0.15)) / n_cross
         c = np.array(river[0]) + (np.array(river[-1]) - np.array(river[0])) * t
-        n = np.array([-math.sin(ang), math.cos(ang)])
-        p0 = _clamp_pts([c + n * S * 0.8], S)[0]
-        p1 = _clamp_pts([c - n * S * 0.8], S)[0]
-        roads.append(_clamp_pts(_wander(rng, p0, p1, 6, S * 0.025), S))
-    for r in roads:
-        shapes.append({"kind": "line", "type": "road",
-                       "width_m": round(float(rng.uniform(7, 12)), 1), "points": r})
+        nv = np.array([-math.sin(ang), math.cos(ang)])
+        p0 = _clamp_pts([c + nv * S * 0.8], S)[0]
+        p1 = _clamp_pts([c - nv * S * 0.8], S)[0]
+        add_road(_clamp_pts(_wander(rng, p0, p1, 6, S * 0.025), S), rng.uniform(7, 10))
 
-    # 3. ПЕРЕПРАВЫ — на каждом пересечении дороги с рекой. Без них река делит карту пополам.
+    # 4. ПЕРЕПРАВЫ — на каждом пересечении дороги с рекой. Без них река делит карту пополам.
     crossings = []
     for r in roads:
         for hit in _seg_hits(r, river):
@@ -144,19 +313,49 @@ def generate(size_m=2550.0, seed=0, battle_edges=True):
             # в этом месте (vectormap.crossing_geom) — мост должен быть узким местом
             shapes.append({"kind": "crossing", "point": [round(hit[0], 1), round(hit[1], 1)]})
 
-    # 4. СЁЛА — в узлах дорог, лентой ВДОЛЬ улицы, а не пятном.
+    # 5. НАСЕЛЁННЫЕ ПУНКТЫ ТРЁХ РАЗМЕРОВ. Раньше их было два, и на театре выходило четырнадцать
+    # одинаковых хуторов по четыре дома на сто квадратных километров — то есть пусто. Город даёт
+    # то, чего на маленькой карте быть не может.
     knots = []
     for i in range(len(roads)):
         for j in range(i + 1, len(roads)):
             knots += _seg_hits(roads[i], roads[j])
+    # Мест под посёлки берём с запасом: одни перекрёстки — это два десятка точек на театр, и
+    # хутора ставить оказывается некуда. Добавляем точки вдоль дорог через каждые полкилометра.
     rng.shuffle(knots)
     spots = list(knots)
-    while len(spots) < n_villages:                            # узлов не хватило — сажаем вдоль дороги
-        r = roads[int(rng.integers(0, len(roads)))]
-        spots.append(tuple(r[int(rng.integers(1, len(r) - 1))]))
-    n_vil = n_villages
-    for v in range(n_vil):
-        kx, ky = spots[v]
+    for r in roads:
+        acc = 0.0
+        for k in range(1, len(r)):
+            acc += math.hypot(r[k][0] - r[k - 1][0], r[k][1] - r[k - 1][1])
+            if acc > 500.0:
+                acc = 0.0
+                spots.append((float(r[k][0]), float(r[k][1])))
+    rng.shuffle(spots)
+
+    n_town = int(round(area_km2 / 45.0))
+    n_village = max(1, int(round(area_km2 / 9.0)))
+    n_hamlet = max(1, int(round(area_km2 / 3.0)))
+    plan = ([("town", int(rng.integers(26, 60))) for _ in range(n_town)]
+            + [("village", int(rng.integers(9, 17))) for _ in range(n_village)]
+            + [("hamlet", int(rng.integers(2, 5))) for _ in range(n_hamlet)])
+    used = []
+    settlements = {"town": 0, "village": 0, "hamlet": 0}
+    for kind, houses in plan:
+        keep = 900.0 if kind == "town" else (450.0 if kind == "village" else 220.0)
+        spot = None
+        for c in spots:
+            if all((c[0] - u[0]) ** 2 + (c[1] - u[1]) ** 2 > keep * keep for u in used):
+                spot = c
+                break
+        if spot is None:
+            continue
+        used.append(spot)
+        spots.remove(spot)
+        kx, ky = spot
+        if battle_edges and not (band < ky < S - band):
+            continue
+        settlements[kind] += 1
         host = min(roads, key=lambda r: min((p[0] - kx) ** 2 + (p[1] - ky) ** 2 for p in r))
         idx = int(np.argmin([(p[0] - kx) ** 2 + (p[1] - ky) ** 2 for p in host]))
         nxt = host[min(idx + 1, len(host) - 1)]
@@ -164,22 +363,33 @@ def generate(size_m=2550.0, seed=0, battle_edges=True):
         ln = float(np.linalg.norm(dirv)) or 1.0
         dirv = dirv / ln
         perp = np.array([-dirv[1], dirv[0]])
-        houses = int(rng.integers(6, 14)) if v == 0 else int(rng.integers(3, 6))
-        for hidx in range(houses):
-            along = (hidx - houses / 2) * rng.uniform(45, 70)
-            sidep = (1 if hidx % 2 else -1) * rng.uniform(22, 40)
-            p = np.array([kx, ky]) + dirv * along + perp * sidep
-            if not (0 < p[0] < S and 0 < p[1] < S):
-                continue
-            shapes.append({"kind": "building",
-                           "rect_m": [round(float(p[0]), 1), round(float(p[1]), 1),
-                                      round(float(rng.uniform(18, 32)), 1),
-                                      round(float(rng.uniform(12, 22)), 1),
-                                      round(float(math.degrees(math.atan2(dirv[1], dirv[0]))
-                                                  + rng.uniform(-12, 12)), 1)],
-                           "capacity": 1})
+        # город растёт кварталами вдоль нескольких улиц, село — лентой вдоль одной, хутор — кучкой
+        streets = 3 if kind == "town" else 1
+        per_street = max(1, houses // streets)
+        for st in range(streets):
+            base = np.array([kx, ky]) + perp * ((st - (streets - 1) / 2) * rng.uniform(70, 110))
+            if kind == "town" and st:
+                # улица города — тоже дорога, иначе кварталы висят в чистом поле
+                a = base - dirv * per_street * 30.0
+                b = base + dirv * per_street * 30.0
+                add_road(_clamp_pts([list(a), list(b)], S), rng.uniform(5, 7))
+            for hidx in range(per_street):
+                along = (hidx - per_street / 2) * rng.uniform(38, 62)
+                sidep = (1 if hidx % 2 else -1) * rng.uniform(20, 38)
+                pnt = base + dirv * along + perp * sidep
+                if not (0 < pnt[0] < S and 0 < pnt[1] < S):
+                    continue
+                big = 1.35 if kind == "town" else 1.0
+                shapes.append({"kind": "building",
+                               "rect_m": [round(float(pnt[0]), 1), round(float(pnt[1]), 1),
+                                          round(float(rng.uniform(16, 30) * big), 1),
+                                          round(float(rng.uniform(11, 20) * big), 1),
+                                          round(float(math.degrees(math.atan2(dirv[1], dirv[0]))
+                                                      + rng.uniform(-10, 10)), 1)],
+                               "capacity": 1})
 
-    # 5. ЛЕС — на неудобьях: по берегу и вдали от дорог. Форма вытянутая и рваная.
+    # 6. ЛЕС ДВУХ РАЗМЕРОВ ПЛЮС МЕЖИ. Прежде все пятна были одного радиуса, и лес на театре
+    # читался как рассыпанный горох.
     def far_from_roads(p, d):
         for r in roads:
             for q in r:
@@ -187,42 +397,54 @@ def generate(size_m=2550.0, seed=0, battle_edges=True):
                     return False
         return True
 
-    band = 300.0 if battle_edges else 0.0
-    n_patch = n_forest
+    n_massif = int(round(area_km2 / 22.0))
+    n_grove = max(3, int(round(area_km2 * rng.uniform(0.8, 1.3))))
+    n_hedge = max(2, int(round(area_km2 * 0.7)))
+    woods = ([("massif", float(rng.uniform(600, 1200))) for _ in range(n_massif)]
+             + [("grove", float(rng.uniform(120, 340))) for _ in range(n_grove)])
     placed = 0
-    for _ in range(n_patch * 8):
-        if placed >= n_patch:
+    for kind, radius in woods:
+        keepout = 400.0 if kind == "massif" else 150.0
+        for _ in range(24):
+            if rng.random() < 0.45 and len(river) > 2:     # прижатый к реке массив
+                t = rng.uniform(0.1, 0.9)
+                i = min(int(t * (len(river) - 1)), len(river) - 2)
+                base = np.array(river[i])
+                nv = np.array([-(river[i + 1][1] - river[i][1]), river[i + 1][0] - river[i][0]])
+                nv = nv / (np.linalg.norm(nv) or 1.0)
+                c = base + nv * rng.uniform(0.02, 0.09) * S * (1 if rng.random() < 0.5 else -1)
+            else:
+                c = rng.uniform(0.08, 0.92, size=2) * S
+            if battle_edges and not (band < c[1] < S - band):
+                continue
+            if not far_from_roads(c, keepout):
+                continue
+            shapes.append({"kind": "polygon", "type": "forest",
+                           "points": [[round(x, 1), round(y, 1)]
+                                      for x, y in _clamp_pts(_blob(rng, c[0], c[1], radius), S)]})
+            placed += 1
             break
-        if rng.random() < 0.45:                               # прижатый к реке массив
-            t = rng.uniform(0.1, 0.9)
-            i = min(int(t * (len(river) - 1)), len(river) - 2)
-            base = np.array(river[i])
-            n = np.array([-(river[i + 1][1] - river[i][1]), river[i + 1][0] - river[i][0]])
-            n = n / (np.linalg.norm(n) or 1.0)
-            c = base + n * rng.uniform(0.02, 0.09) * S * (1 if rng.random() < 0.5 else -1)
-        else:
-            c = rng.uniform(0.08, 0.92, size=2) * S
-        if battle_edges and not (band < c[1] < S - band):
-            continue
-        if not far_from_roads(c, ROAD_KEEPOUT):
-            continue
-        r = rng.uniform(*FOREST_R)
-        shapes.append({"kind": "polygon", "type": "forest",
-                       "points": [[round(x, 1), round(y, 1)]
-                                  for x, y in _clamp_pts(_blob(rng, c[0], c[1], r), S)]})
-        placed += 1
 
-    # 6. МЕЖИ — узкие лесополосы по границам полей. Дают укрытие, не превращая поле в стену.
     for _ in range(n_hedge):
         p0 = rng.uniform(0.05, 0.95, size=2) * S
         d = rng.uniform(-1, 1, size=2)
         d = d / (np.linalg.norm(d) or 1.0)
-        p1 = p0 + d * rng.uniform(300.0, 900.0)              # межа — сотни метров, не доля карты
+        p1 = p0 + d * rng.uniform(300.0, 900.0)
         shapes.append({"kind": "line", "type": "forest",
                        "width_m": round(float(rng.uniform(18, 32)), 1),
                        "points": _clamp_pts(_wander(rng, p0, p1, 3, S * 0.012), S)})
 
-    return vectormap.new_doc((S, S), shapes), {"crossings": len(crossings), "villages": n_vil}
+    doc = vectormap.new_doc((S, S), shapes)
+    doc["height"] = {"cell_m": cell, "h": height}
+    # ДОЛИНА врезается в готовое поле высот: русло уже лежит в низине, но берега надо оформить,
+    # иначе река идёт по плоскому и не читается как река.
+    vectormap.stamp(doc, [{"kind": "line", "type": "relief", "points": river,
+                           "h_m": -float(np.clip(0.0022 * S, 6.0, 30.0)),
+                           "width_m": river_w * 3.0}],
+                    cell_m=cell, slope_m=float(np.clip(0.03 * S, 120.0, 400.0)))
+    return doc, {"crossings": len(crossings), "villages": settlements["village"],
+                 "towns": settlements["town"], "hamlets": settlements["hamlet"],
+                 "forests": placed, "relief_m": float(height.max() - height.min())}
 
 
 def generate_good(size_m=2550.0, seed=0, cell_m=30.0, tries=8, battle_edges=True, any_map=False):
@@ -237,8 +459,8 @@ def generate_good(size_m=2550.0, seed=0, cell_m=30.0, tries=8, battle_edges=True
         return doc, measure(surface, cell_m, n_pairs=300), 1
     for k in range(tries):
         doc, info = generate(size_m, seed * 1000 + k, battle_edges)
-        surface, *_ = vectormap.rasterize(doc, cell_m)
-        m = measure(surface, cell_m, n_pairs=300)
+        surface, fields, *_ = vectormap.rasterize(doc, cell_m)
+        m = measure(surface, cell_m, n_pairs=300, fields=fields)
         if not m["bad"]:
             return doc, m, k + 1
     return doc, m, tries
@@ -263,8 +485,8 @@ def cut_crops(theatre_path, count, size_m, cell_m, out_dir, seed=0, keep_bad=Fal
         piece = vectormap.crop(doc, (cx, cy), (size_m, size_m), ang)
         if len(piece["shapes"]) < 3:
             continue
-        surface, *_ = vectormap.rasterize(piece, cell_m)
-        m = measure(surface, cell_m, n_pairs=300)
+        surface, fields, *_ = vectormap.rasterize(piece, cell_m)
+        m = measure(surface, cell_m, n_pairs=300, fields=fields)
         if m["bad"] and not keep_bad:
             continue
         name = f"{os.path.splitext(os.path.basename(theatre_path))[0].replace('.vector', '')}_c{made}"

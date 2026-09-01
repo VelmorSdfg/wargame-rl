@@ -223,6 +223,41 @@ def part_vector():
                    if tm.grid[gx, int(1035 / 15)] == tid["road"]]
     ok(len(near_bridge) > 0, "мост пробил воду и положил дорогу")
 
+    # ГЛАВНОЕ про переправу: не «есть ли клетка дороги», а ПРОХОДИМА ли карта насквозь.
+    # Долгое время мост не работал вовсе: клетка имеет один тип, тип берётся по доле покрытия,
+    # и мост в восемь метров при клетке в тридцать проигрывал воде всегда. Дорога рисовалась,
+    # переправа стояла, а река делила карту пополам — и это не было видно ничем, кроме боя.
+    free = ~tm.f_impassable
+    lab = -np.ones(free.shape, dtype=np.int32)
+    n_comp = 0
+    for i0 in range(free.shape[0]):
+        for j0 in range(free.shape[1]):
+            if not free[i0, j0] or lab[i0, j0] >= 0:
+                continue
+            stack = [(i0, j0)]
+            lab[i0, j0] = n_comp
+            while stack:
+                a, b = stack.pop()
+                for da, db in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    c, d = a + da, b + db
+                    if (0 <= c < free.shape[0] and 0 <= d < free.shape[1]
+                            and free[c, d] and lab[c, d] < 0):
+                        lab[c, d] = n_comp
+                        stack.append((c, d))
+            n_comp += 1
+    sizes = sorted((int((lab == k).sum()) for k in range(n_comp)), reverse=True)
+    big = sizes[0] if sizes else 0
+    ok(big > 0.9 * int(free.sum()),
+       f"переправа держит карту единой: крупнейший проходимый кусок {big} клеток из "
+       f"{int(free.sum())} ({n_comp} кусков всего)")
+    # и берега соединены именно через мост: точки по обе стороны реки в одном куске
+    left = (int(1235 / 15) - 6, int(1035 / 15))
+    right = (int(1235 / 15) + 6, int(1035 / 15))
+    ok(lab[left] >= 0 and lab[left] == lab[right],
+       "берега по обе стороны моста лежат в одном проходимом куске")
+    narrow_bridge()
+
+
     g = meta["graph"]
     ok(len(g["nodes"]) >= 3 and len(g["edges"]) >= 2,
        f"граф дорог собран: {len(g['nodes'])} узлов, {len(g['edges'])} участков")
@@ -302,15 +337,118 @@ def part_vector():
           f"вердикт {'ГОДНА' if not m['bad'] else '; '.join(m['bad'])}")
     ok(0.05 < m["vis"] < 0.99, "мерка работает на векторной карте")
 
+    # --- ОКОННАЯ растеризация: кусок карты должен совпадать с тем же куском целой.
+    # На этом стоит вся кусочная местность в редакторе: вблизи камеры показывается не другая
+    # карта, а та же самая, просто посчитанная мельче. Разойдись они — редактор врал бы про то,
+    # что достанется бою.
+    full = vectormap.rasterize(doc, 15.0)[0]
+    win = vectormap.surface_window(doc, 15.0, 600.0, 900.0, 600.0, 600.0)
+    same = np.array_equal(win, full[40:80, 60:100])
+    ok(same, "окно карты совпадает с тем же куском полной растеризации, клетка в клетку")
+    fine = vectormap.surface_window(doc, 5.0, 600.0, 900.0, 600.0, 600.0)
+    ok(fine.shape == (120, 120), f"мелкая клетка даёт втрое подробнее: {fine.shape[0]} клеток на 600 м")
+
     for suffix in (".fields.npz", ".map.json"):
         p = prefix + "_c30" + suffix
         if os.path.exists(p):
             os.remove(p)
 
 
+def narrow_bridge():
+    """УЗКИЙ мост в КРУПНОЙ клетке — тот случай, на котором переправа и не работала.
+
+    На учебной карте мост шириной 60 м при клетке 15 м проходил и по старому счёту: он занимал
+    больше половины клетки и выигрывал долевой спор с водой. А настоящая дорога — восемь метров,
+    и на театре клетка тридцать: мост занимает четверть клетки и проигрывает воде всегда. Так и
+    было: 10 переправ из 12 оказывались непроходимыми, река делила карту пополам, и заметить это
+    можно было только в бою. Поэтому проверка ставит именно такой мост."""
+    S, cell = 1200.0, 30.0
+    doc = vectormap.new_doc((S, S), [
+        {"kind": "line", "type": "water", "width_m": 60,
+         "points": [[0, 600], [1200, 600]]},
+        {"kind": "line", "type": "road", "width_m": 8,
+         "points": [[600, 0], [600, 1200]]},
+        {"kind": "crossing", "point": [600, 600]},
+    ])
+    path = vectormap.save(doc, os.path.join(ROOT, "maps", "demo_bridge.vector.json"))
+    try:
+        prefix, surface, meta = vectormap.build(path, cell_m=cell)
+        tm, _meta = vectormap.load_map(prefix, M_PER_UNIT)
+        free = ~tm.f_impassable
+        j = int(600 / cell)
+        a, b = (int(600 / cell), j - 4), (int(600 / cell), j + 4)
+        lab = -np.ones(free.shape, dtype=np.int32)
+        stack, n = [a], 0
+        if free[a]:
+            lab[a] = 0
+            while stack:
+                x, y = stack.pop()
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    c, d = x + dx, y + dy
+                    if (0 <= c < free.shape[0] and 0 <= d < free.shape[1]
+                            and free[c, d] and lab[c, d] < 0):
+                        lab[c, d] = 0
+                        stack.append((c, d))
+        ok(free[a] and free[b] and lab[b] == 0,
+           f"узкий мост (дорога 8 м, клетка {cell:.0f} м) проходим: берега соединены")
+        tid2 = vectormap._types()
+        strip = [int(surface[int(600 / cell), k] == tid2["road"])
+                 for k in range(j - 2, j + 3)]
+        ok(sum(strip) >= 3,
+           f"полоса моста непрерывна поперёк реки: клетки дороги {strip}")
+    finally:
+        for ext in (".vector.json", ".fields.npz", ".map.json"):
+            f = os.path.join(ROOT, "maps", "demo_bridge" + ext)
+            if os.path.exists(f):
+                os.remove(f)
+
+
+def ford_vs_bridge():
+    """БРОД — не мост. Оба пробивают воду, но мост кладёт дорогу, а брод остаётся бродом.
+
+    Разница не косметическая. Дорога у нас быстрее поля (1.1, техника 1.5), брод медленнее всего
+    (0.45, техника 0.3). Пока брод считался дорогой, переход реки вброд выходил БЫСТРЕЕ обхода
+    посуху — местность врала в сторону, обратную здравому смыслу, и обходить реку не было смысла."""
+    types, _, _, speed, _, imp, veh, _ = terrain._type_tables()
+    tid = {n: t["id"] for n, t in types.items()}
+    S, cell = 900.0, 15.0
+    doc = vectormap.new_doc((S, S), [
+        {"kind": "line", "type": "water", "width_m": 40, "points": [[450, 0], [450, 900]]},
+        {"kind": "line", "type": "road", "width_m": 8, "points": [[0, 200], [900, 200]]},
+        {"kind": "crossing", "point": [450, 200]},                     # мост на дороге
+        {"kind": "crossing", "point": [450, 700], "ford": True},       # брод в стороне от дорог
+    ])
+    surface, fields, comp, cap = vectormap.rasterize(doc, cell)
+    c = lambda x, y: int(surface[int(x / cell), int(y / cell)])
+    ok(c(450, 200) == tid["road"], "мост даёт клетку ДОРОГИ")
+    ok(c(450, 700) == tid["ford"], "брод даёт клетку БРОДА, а не дороги")
+    ok(c(450, 450) == tid["water"], "река между ними осталась водой")
+    ok(not imp[tid["ford"]] and not imp[tid["road"]], "и брод, и мост проходимы")
+    ok(speed[tid["ford"]] < speed[tid["open"]] < speed[tid["road"]],
+       f"брод медленнее поля, мост быстрее: {speed[tid['ford']]:.2f} < "
+       f"{speed[tid['open']]:.2f} < {speed[tid['road']]:.2f}")
+    ok(veh[tid["ford"]] < veh[tid["open"]],
+       f"технике брод дороже, чем пешим: {veh[tid['ford']]:.2f} против {speed[tid['ford']]:.2f}")
+
+    # окно карты обязано совпадать с полной растеризацией — иначе редактор покажет одно, а бой
+    # получит другое, и разойдётся это молча
+    win = vectormap.surface_window(doc, cell, 300.0, 600.0, 300.0, 300.0)
+    full = surface[int(300 / cell):int(600 / cell), int(600 / cell):int(900 / cell)]
+    ok(win.shape == full.shape and int((win != full).sum()) == 0,
+       "окно вокруг брода совпадает с полной растеризацией клетка в клетку")
+
+    # То же для МОСТА — на нём и вскрылась давняя ошибка: столбец переправы считался от нуля
+    # карты, а сетка окна начинается с произвольного x. Мост съезжал на x0/клетку столбцов или
+    # выпадал за край вовсе, и в стиле «клетки боя» его не было на всех кусках, кроме левого.
+    winb = vectormap.surface_window(doc, cell, 300.0, 60.0, 300.0, 300.0)
+    fullb = surface[int(300 / cell):int(600 / cell), int(60 / cell):int(360 / cell)]
+    ok(int((winb != fullb).sum()) == 0, "окно вокруг МОСТА совпадает с полной растеризацией")
+
+
 def main():
     part_legacy()
     part_vector()
+    ford_vs_bridge()
     print("\nПРОВАЛОВ: " + (str(len(FAILED)) + " — " + "; ".join(FAILED) if FAILED else "нет"))
     return 1 if FAILED else 0
 

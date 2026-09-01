@@ -79,6 +79,11 @@ def build_mirrored_env(src):
     dst._settle = src._settle[perm].copy()
     dst._moved = src._moved[perm].copy()
     dst.ammo = [src.ammo[perm[k]].copy() for k in range(src.n)]
+    # ЗАДАЧА И УДЕРЖАНИЕ — тоже состояние по сторонам, и появились они уже после того, как этот
+    # тест был написан. Без переноса dst получал задачу от своего reset(): наступление против
+    # обороны сравнивалось с обороной против наступления, и падал не движок, а сам тест.
+    dst.mission = 1 - src.mission
+    dst._hold = np.array([src._hold[1], src._hold[0]], dtype=np.float32)
     # Миномёты — состояние ПО СТОРОНАМ, значит при обмене сторон меняются и они. Точка вызова
     # вдобавок отражается по Y, как всё остальное на карте.
     dst._mortar_left[0], dst._mortar_left[1] = src._mortar_left[1], src._mortar_left[0]

@@ -966,7 +966,14 @@ class WarGameEnv(gym.Env):
             return
         v = v / nrm * min(nrm, 1.0) * eff
         newp = np.clip(self.pos[i] + v, 0.0, ARENA)
-        if self._can_stand(newp, is_veh, i):
+        # УКЛОН. Скорость по клетке уже учтена, теперь — подъём: он и замедляет, и на крутизне
+        # запрещает шаг вовсе. На плоской карте множитель равен единице, и всё как раньше.
+        slope = self.map.slope_factor(self.pos[i], newp, is_veh)
+        if slope <= 0.0:
+            newp = self.pos[i]
+        elif slope < 1.0:
+            newp = np.clip(self.pos[i] + v * slope, 0.0, ARENA)
+        if not np.array_equal(newp, self.pos[i]) and self._can_stand(newp, is_veh, i):
             self.pos[i] = newp
         else:  # упёрлись в стену/занятое здание — скользим вдоль (по одной оси)
             for comp in ([v[0], 0.0], [0.0, v[1]]):

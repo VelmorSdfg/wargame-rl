@@ -10,6 +10,7 @@
 и зданий, чтобы агент не заучивал одну карту.
 """
 import json
+import math
 import os
 
 import numpy as np
@@ -28,7 +29,21 @@ EDGE_STRIDE = 3
 DEEP_STRIDE = 3
 
 
-FIELDS = ("cover", "speed_foot", "speed_veh", "see_limit", "see_limit_dem", "blocks", "impassable")
+FIELDS = ("cover", "speed_foot", "speed_veh", "see_limit", "see_limit_dem", "blocks",
+          "impassable", "height")
+
+# Высота глаз над землёй, в ИГРОВЫХ единицах (2 м при 15 м/ед). Ею определяется, укроет ли
+# гребень: наблюдатель и цель смотрят не с земли, а с высоты роста, и складка глубиной в метр
+# перестаёт быть укрытием.
+EYE_UNITS = 2.0 / 15.0
+
+# Уклон. Подъём стоит времени, крутизна не берётся вовсе. Числа взяты по нормативам движения
+# пехоты и техники: пеший теряет около трети скорости на подъёме в 20%, техника — половину;
+# предел для техники ~27 градусов (0.5), для пехоты почти вдвое круче.
+SLOPE_SLOWDOWN_FOOT = 1.8
+SLOPE_SLOWDOWN_VEH = 3.2
+MAX_GRADE_FOOT = 0.90
+MAX_GRADE_VEH = 0.50
 
 
 def fields_from_surface(grid):
@@ -43,7 +58,10 @@ def fields_from_surface(grid):
     g = grid.astype(np.int32)
     return {"cover": cover_by_id[g], "speed_foot": speed_by_id[g], "speed_veh": veh_speed_by_id[g],
             "see_limit": see_through_by_id[g], "see_limit_dem": see_through_demolish_by_id[g],
-            "blocks": blocks_by_id[g], "impassable": impassable_by_id[g]}
+            "blocks": blocks_by_id[g], "impassable": impassable_by_id[g],
+            # плоская карта: рельефа нет, и все проверки высоты обязаны схлопнуться в ноль —
+            # старые карты должны вести себя ровно как раньше
+            "height": np.zeros(g.shape, dtype=np.float32)}
 
 
 class TerrainMap:
@@ -90,7 +108,10 @@ class TerrainMap:
         self.f_see_dem = np.asarray(f["see_limit_dem"], dtype=np.float32)
         self.f_blocks = np.asarray(f["blocks"], dtype=bool)
         self.f_impassable = np.asarray(f["impassable"], dtype=bool)
+        self.f_height = np.asarray(f.get("height", np.zeros(grid.shape)), dtype=np.float32)
+        self.has_relief = bool(np.any(self.f_height))   # плоская карта -> профиль не считаем
         # маски для поиска ближайшего: считаются один раз, а не предикатом на каждую клетку
+        self._inv_cell = 1.0 / float(cell_size)
         self._road_mask = (self.f_speed_foot > 1.0) | (self.f_speed_veh > 1.0)
         self._cover_mask = self.f_cover > 0
         self._is_building = self.grid == building_id
@@ -116,13 +137,52 @@ class TerrainMap:
         return True
 
     def _cell(self, pos):
-        gx = int(np.clip(pos[0] // self.cell, 0, self.Gx - 1))
-        gy = int(np.clip(pos[1] // self.cell, 0, self.Gy - 1))
+        """Точка -> клетка. Самая горячая функция всего боя: её зовёт каждый шаг луча линии
+        огня, а лучей за шаг десятки тысяч. Здесь СПЕЦИАЛЬНО нет numpy: np.clip на скаляре стоит
+        около трёх микросекунд, и на 1.9 млн вызовов за сто двадцать шагов это была треть всего
+        времени боя. Обычная арифметика Python делает то же самое в разы дешевле."""
+        gx = int(pos[0] // self.cell)
+        gy = int(pos[1] // self.cell)
+        if gx < 0:
+            gx = 0
+        elif gx >= self.Gx:
+            gx = self.Gx - 1
+        if gy < 0:
+            gy = 0
+        elif gy >= self.Gy:
+            gy = self.Gy - 1
         return gx, gy
 
     def _id_at(self, pos):
         gx, gy = self._cell(pos)
         return int(self.grid[gx, gy])
+
+    def height_at(self, pos):
+        """Высота земли в точке, в игровых единицах."""
+        gx, gy = self._cell(pos)
+        return float(self.f_height[gx, gy])
+
+    def slope_factor(self, p0, p1, is_vehicle=False):
+        """Во сколько раз медленнее идти из p0 в p1 из-за уклона; 0.0 — не пройти.
+
+        Считается по ходу движения, а не по клетке: одна и та же крутизна вниз и вверх — разные
+        вещи. Спуск не ускоряем: на тактическом темпе выигрыша нет, а осторожность на спуске
+        съедает его целиком.
+        """
+        if not self.has_relief:
+            return 1.0
+        d = np.asarray(p1, dtype=np.float32) - np.asarray(p0, dtype=np.float32)
+        run = float(np.linalg.norm(d))
+        if run < 1e-6:
+            return 1.0
+        rise = self.height_at(p1) - self.height_at(p0)
+        grade = rise / run
+        if grade > (MAX_GRADE_VEH if is_vehicle else MAX_GRADE_FOOT):
+            return 0.0
+        if grade <= 0:
+            return 1.0
+        k = SLOPE_SLOWDOWN_VEH if is_vehicle else SLOPE_SLOWDOWN_FOOT
+        return float(1.0 / (1.0 + k * grade))
 
     def cover_at(self, pos):
         gx, gy = self._cell(pos)
@@ -133,18 +193,30 @@ class TerrainMap:
         return float(self.f_speed_veh[gx, gy] if is_vehicle else self.f_speed_foot[gx, gy])
 
     def _nearest_matching_point(self, pos, radius, mask):
-        """Ближайшая (в метрах) точка клетки, попавшей в маску, в радиусе. None, если нет."""
+        """Ближайшая (в метрах) точка клетки, попавшей в маску, в радиусе. None, если нет.
+
+        Считается пачкой, а не двойным циклом: окно радиуса — это сотни клеток, и перебор их
+        по одной в питоне стоил около трети миллисекунды на вызов, а зовётся это на каждый шаг
+        каждого юнита. Порядок обхода сохранён (сначала по x, потом по y), поэтому при равных
+        расстояниях выбирается ровно та же клетка, что и раньше."""
         gx, gy = self._cell(pos)
         rc = int(radius / self.cell)
-        best = None; bestd = 1e18
-        for x in range(max(0, gx - rc), min(self.Gx, gx + rc + 1)):
-            for y in range(max(0, gy - rc), min(self.Gy, gy + rc + 1)):
-                if mask[x, y]:
-                    wx = (x + 0.5) * self.cell; wy = (y + 0.5) * self.cell
-                    dd = (wx - pos[0]) ** 2 + (wy - pos[1]) ** 2
-                    if 1e-6 < dd < bestd:
-                        bestd = dd; best = (wx, wy)
-        return best
+        x0, x1 = max(0, gx - rc), min(self.Gx, gx + rc + 1)
+        y0, y1 = max(0, gy - rc), min(self.Gy, gy + rc + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        sub = mask[x0:x1, y0:y1]
+        if not sub.any():
+            return None
+        wx = (np.arange(x0, x1, dtype=np.float32) + 0.5) * self.cell - pos[0]
+        wy = (np.arange(y0, y1, dtype=np.float32) + 0.5) * self.cell - pos[1]
+        dd = wx[:, None] ** 2 + wy[None, :] ** 2
+        dd = np.where(sub & (dd > 1e-6), dd, np.inf)
+        k = int(np.argmin(dd))
+        if not np.isfinite(dd.flat[k]):
+            return None
+        i, j = divmod(k, y1 - y0)
+        return ((x0 + i + 0.5) * self.cell, (y0 + j + 0.5) * self.cell)
 
     def nearest_road_point(self, pos, radius=25.0):
         """Мировые координаты (не вектор!) ближайшей клетки дороги в радиусе, или None.
@@ -347,35 +419,71 @@ class TerrainMap:
         """Перекрыта ли линия огня между p0 и p1? Здание блокирует сразу (кроме своих/целевых
         компонент из transparent). Лес — накопительно: блокирует, если суммарная толщина леса
         вдоль луча превышает see_through_m (обычное оружие) или see_through_demolish_m (фугас —
-        видит/бьёт сквозь лес ДАЛЬШЕ, но НЕ бесконечно — было багом "видит лес насквозь")."""
-        d = np.asarray(p1, dtype=np.float32) - np.asarray(p0, dtype=np.float32)
+        видит/бьёт сквозь лес ДАЛЬШЕ, но НЕ бесконечно — было багом "видит лес насквозь").
+        Рельеф перекрывает луч, если земля поднимается выше линии от глаз к глазам.
+
+        Считается пачкой, а не шагами в цикле: луч — самый горячий путь всего боя (треть
+        времени шага). Результат тот же, потому что ответ здесь булев: раз накопленная толщина
+        превысила порог хоть где-то, порядок обхода не важен, и сумму можно взять сразу по
+        всему лучу.
+        """
+        p0 = np.asarray(p0, dtype=np.float32)
+        p1 = np.asarray(p1, dtype=np.float32)
+        d = p1 - p0
+        # ВАЖНО: длина и координаты вдоль луча считаются ровно как раньше — одинарная точность
+        # для разности, двойная для хода по лучу. Считать «эквивалентно, но иначе» тут нельзя:
+        # на границе клетки луч уходит в соседнюю, и линия огня меняется. Проверка боями это
+        # поймала сразу.
         dist = float(np.linalg.norm(d))
         if dist < 1e-6:
             return False
         c0 = self._cell(p0)
         c1 = self._cell(p1)
         steps = int(dist / (self.cell * 0.5)) + 1
+        if steps < 2:
+            return False
         step_len = dist / steps
-        lim = self.f_see_dem if demolish else self.f_see
-        # Копим ПО ВЕЛИЧИНЕ ПОРОГА, а не по типу клетки: у поля нет типа, у него есть число
-        # «сколько метров этого материала терпит луч». Пока карта строится из типов, это то же
-        # самое (у леса 6, у здания 0 — пороги разные). Два разных материала с ОДИНАКОВЫМ
-        # порогом здесь сложатся в один счётчик — так и должно быть: это один и тот же матовый
-        # материал с точки зрения луча.
-        acc = {}
-        for s in range(1, steps):
-            p = p0 + d * (s / steps)
-            c = self._cell(p)
-            if c == c0 or c == c1:
-                continue
-            comp = self.building_comp[c[0], c[1]]
-            if comp != 0 and comp in transparent:
-                continue  # прозрачное здание (своё / цель под фугасным огнём)
-            if not self.f_blocks[c[0], c[1]]:
-                continue
-            t = float(lim[c[0], c[1]])
-            acc[t] = acc.get(t, 0.0) + step_len
-            if acc[t] > t:
+
+        t = np.arange(1, steps, dtype=np.float64) / steps
+        ix = np.floor((p0[0] + d[0] * t) / self.cell).astype(np.int32)
+        iy = np.floor((p0[1] + d[1] * t) / self.cell).astype(np.int32)
+        np.clip(ix, 0, self.Gx - 1, out=ix)
+        np.clip(iy, 0, self.Gy - 1, out=iy)
+
+        # клетки самого стрелка и самой цели не считаются — своё укрытие не мешает
+        keep = ~(((ix == c0[0]) & (iy == c0[1])) | ((ix == c1[0]) & (iy == c1[1])))
+        if not keep.any():
+            return False
+        ix = ix[keep]
+        iy = iy[keep]
+
+        if self.has_relief:
+            h0 = self.f_height[c0[0], c0[1]] + EYE_UNITS
+            h1 = self.f_height[c1[0], c1[1]] + EYE_UNITS
+            line = h0 + (h1 - h0) * t[keep].astype(np.float32)
+            if (self.f_height[ix, iy] > line).any():
+                return True
+
+        blocks = self.f_blocks[ix, iy]
+        if not blocks.any():
+            return False
+        if transparent:
+            # ВАЖНО: ноль означает «не здание», и он частенько попадает в transparent — среда
+            # кладёт туда компоненту под стрелком, а тот обычно не в доме. Без проверки на ноль
+            # прозрачными становились ВСЕ не-здания, включая лес, и линия огня открывалась
+            # через весь лес. Бои это поймали сразу, случайные лучи — нет: там transparent пуст.
+            comp = self.building_comp[ix, iy]
+            see_through = (comp != 0) & np.isin(comp, np.fromiter(transparent, dtype=np.int32))
+            blocks = blocks & ~see_through
+            if not blocks.any():
+                return False
+
+        lim = (self.f_see_dem if demolish else self.f_see)[ix, iy][blocks]
+        if (lim <= 0).any():                       # здание: гасит луч сразу
+            return True
+        # остальное копится по материалам: столько метров этого материала луч терпит
+        for v in np.unique(lim):
+            if float(np.count_nonzero(lim == v)) * step_len > v:
                 return True
         return False
 
