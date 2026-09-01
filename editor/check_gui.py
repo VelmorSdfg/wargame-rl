@@ -58,6 +58,16 @@ def click(e, x, y):
 
 
 def main():
+    # Весь набор проверяет ЗАКАДРОВЫЙ путь: он снимает кадры подменой _blit, а в виджете с
+    # GL-контекстом _blit не зовётся вовсе — кадр уходит прямо в окно. Путь этот никуда не делся,
+    # он же запасной для машин без видеокарты.
+    #
+    # Гасим виджет НА УРОВНЕ МОДУЛЯ, а не у отдельных редакторов. Точечное «у этого и вон у того»
+    # уже стоило двадцати ТИХО ПРОПУЩЕННЫХ проверок: блок огорожен «e._gl is not None», а _gl у
+    # виджета заводится лишь при первом показе окна — в прогоне без окна он оставался пустым, и
+    # набор печатал «провалов нет», не выполнив пятую часть себя.
+    real_gl_widget = ed._gl_widget_class
+    ed._gl_widget_class = lambda: None
     root = tk.Tk()
     root.geometry("1400x880")
     app = ed.App(root)
@@ -1411,6 +1421,11 @@ def main():
     # ключу «вид + номер квадрата», ключ после правки не менялся, и она оставляла прежнюю.
     # Нарисованное появлялось только после смены стиля, когда ключ менялся целиком.
     e = app.frame if not isinstance(app.frame, ed.StartScreen) else None
+    # Пропуск блока делаем ГРОМКИМ. Молчаливый уже подводил: набор печатал «провалов нет», не
+    # выполнив двадцати проверок, и заметить это можно было только сверив их ЧИСЛО.
+    if e is None or e._gl is None:
+        ok(False, "блок правки в объёме пропущен: редактор=%s, рисовальщик=%s"
+                  % (e is not None, e._gl is not None if e is not None else None))
     if e is not None and e._gl is not None:
         frames = []
         blit = e._blit
@@ -1667,14 +1682,20 @@ def main():
         e._select([])
 
         e.do_undo()
-        settle(2.0)
+        # Срок больше прежних двух секунд: к этому месту набор успевает наделать правок, а
+        # пересчёт кусков после протяжки приходит одним залпом на отпускании — во время самой
+        # протяжки их не трогают. Проверка про переключение стиля, а не про то, за сколько
+        # досчитаются куски; если не досчитались — скажем об этом прямо, а не покажем «не готовы».
+        done_style = settle(20.0)
 
         # Переключение стиля НЕ должно грубить картинку. Куски лежат по стилям, поэтому прежний
         # стиль подменяет новый на время счёта — той же подробности, а не растянутым верхним
         # уровнем (вся карта в 512 точек). Возврат к посчитанному стилю — мгновенный.
         keys = e._tiles.select(e.cam, (e.W, e.H))
         ok(keys and all(e._tiles.get(k) is not None for k in keys),
-           f"перед переключением все куски готовы ({len(keys)})")
+           f"перед переключением все куски готовы ({len(keys)})"
+           + ("" if done_style else "  [НЕ ДОСЧИТАЛОСЬ за 20 с — проверка ниже про стиль, "
+                                    "а не про скорость счёта]"))
         was_style = e.map_style.get()
         e.map_style.set("cells")
         e.draw()
@@ -1685,13 +1706,14 @@ def main():
         ok(len(subs) == len(deep) and len(subs) > 0,
            f"на переключении стиля куски подменяются СВОИМ квадратом в прежнем стиле "
            f"({len(subs)} из {len(keys)}), а не растянутым верхним уровнем")
-        settle()
+        done_back = settle(20.0)
         e.map_style.set(was_style)          # назад к тому, что уже посчитано
         e.draw()
         keys = e._tiles.select(e.cam, (e.W, e.H))
         ready = sum(1 for k in keys if e._tiles.get(k) is not None)
         ok(ready == len(keys),
-           f"возврат к уже посчитанному стилю мгновенный: готовы все {ready} кусков")
+           f"возврат к уже посчитанному стилю мгновенный: готовы все {ready} кусков"
+           + ("" if done_back else "  [НЕ ДОСЧИТАЛОСЬ за 20 с]"))
 
         # Печать рельефа в топостиле трогает и горизонтали, поэтому куски сбрасываются по
         # ЗАДЕТОЙ ОКРУГЕ, а не все разом. Проверяем, что округа взята не на глазок: то же
@@ -1849,6 +1871,43 @@ def main():
             os.remove(f)
     if os.path.exists(sc_path):
         os.remove(sc_path)
+
+    # --- объём В ОКНЕ: своё окно со своим редактором, чтобы не мешать проверкам выше
+    ed._gl_widget_class = real_gl_widget          # виджету — свои проверки, с настоящим классом
+    try:
+        w_root = tk.Toplevel(root)
+        w_root.geometry("1000x760")
+        w_app = ed.App(w_root)
+        w_root.update()
+        w_app.show_editor(ed.Doc(vectormap.new_doc((P.ARENA_M, P.ARENA_M)), P.CELL_M, "окно"))
+        w_root.update()
+        we = w_app.frame
+        ok(we._glw is not None, "виджет с настоящим GL-контекстом заводится")
+        if we._glw is not None:
+            we.fit_view()
+            we.mode3d.set(True)
+            we._toggle_3d()
+            w_root.update()
+            ok(we._in_widget and we._gl is not None and getattr(we._gl, "to_screen", False),
+               "в объёме кадр идёт ПРЯМО В ОКНО, без чтения обратно в память")
+            for _ in range(6):
+                we.draw_3d()
+                w_root.update()
+            ok(True, "кадры в окне рисуются без ошибок")
+            we.mode3d.set(False)
+            we._toggle_3d()
+            w_root.update()
+            ok(not we._in_widget, "на плане возвращается холст")
+            we.mode3d.set(True)
+            we._toggle_3d()
+            we.draw_3d()
+            w_root.update()
+            ok(we._in_widget and we._gl is not None,
+               "повторный вход в объём работает: контекст виджета пересоздаётся")
+        w_root.destroy()
+    except Exception as ex:                                  # noqa: BLE001
+        ok(False, "объём в окне: %s: %s" % (type(ex).__name__, ex))
+
     root.destroy()
     print("\nПРОВАЛОВ: " + (str(len(FAILED)) + " — " + "; ".join(FAILED) if FAILED else "нет"))
     return 1 if FAILED else 0

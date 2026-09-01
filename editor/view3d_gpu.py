@@ -347,6 +347,13 @@ class GLView:
             self.prog_solid, [(self.ctx.buffer(gv.tobytes()), "3f 3f", "in_pos", "in_color")],
             self.ctx.buffer(gi.tobytes()))
 
+    def _screen(self):
+        """Буфер окна. ctx.screen у свежесозданного контекста бывает пустым — тогда спрашиваем
+        у драйвера напрямую. Ловится это только на ПОВТОРНОМ входе в объём: виджет пересоздаёт
+        контекст, и прежний ответ уже не годится."""
+        scr = self.ctx.screen
+        return scr if scr is not None else self.ctx.detect_framebuffer()
+
     def blit_overlay(self, rgba):
         """Наложения поверх кадра ОДНОЙ картинкой: обводка, узлы, черновик, линейка, счётчик.
 
@@ -370,7 +377,7 @@ class GLView:
             quad = np.array([-1, -1, 3, -1, -1, 3], dtype="f4")
             self._vao_flat = self.ctx.vertex_array(
                 self._prog_flat, [(self.ctx.buffer(quad.tobytes()), "2f", "in_pos")])
-        self.ctx.screen.use()
+        self._screen().use()
         self.ctx.disable(self.mgl.DEPTH_TEST)
         self._over_tex.use(3)
         self._prog_flat["over"].value = 3
@@ -540,7 +547,7 @@ class GLView:
         if self.to_screen:
             # сглаженный кадр переливаем прямо в окно. MSAA держим СВОЙ, а не просим у окна:
             # так сглаживание не зависит от того, каким контекст создал виджет
-            self.ctx.copy_framebuffer(self.ctx.screen, self.msaa)
+            self.ctx.copy_framebuffer(self._screen(), self.msaa)
             return None
         self.ctx.copy_framebuffer(self.plain, self.msaa)
         return Image.frombytes("RGB", self._size, self.plain.read(components=3))

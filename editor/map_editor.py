@@ -63,6 +63,34 @@ def _timer_resolution(ms=1):
         return None                                          # чужая система — живём как жили
 
 
+def _gl_widget_class():
+    """Класс виджета с настоящим GL-контекстом или None, если pyopengltk нет.
+
+    Импорт ленивый и необязательный: без пакета редактор работает как раньше, через холст.
+    Так же ведёт себя и moderngl — редактор не должен падать оттого, что чего-то не поставили."""
+    try:
+        from pyopengltk import OpenGLFrame
+    except Exception:                                        # noqa: BLE001
+        return None
+
+    class GLCanvas(OpenGLFrame):
+        """Холст объёмного вида. Всё рисование делает владелец — виджет только даёт контекст."""
+
+        def __init__(self, master, owner, **kw):
+            self.owner = owner
+            self._ready = False
+            OpenGLFrame.__init__(self, master, **kw)
+
+        def initgl(self):
+            self._ready = self.owner._gl_widget_init()
+
+        def redraw(self):
+            if self._ready:
+                self.owner._gl_widget_redraw()
+
+    return GLCanvas
+
+
 def _font(size=12):
     """Шрифт для подписей НА ХОЛСТЕ. Встроенный шрифт Pillow кириллицу не знает и рисует
     квадраты — «об.1» и «С» превращались в мусор."""
@@ -952,6 +980,10 @@ class EditorFrame(ttk.Frame):
         self._box3d = None              # рамка выделения в объёме, в ПИКСЕЛЯХ экрана
         self._vision = None             # (точка, маска видимости, клетка, угол окна)
         self._vis_key = None            # чем помечена залитая маска: чтобы не заливать зря
+        self._boxes_key = None          # чем помечены посчитанные коробки домов
+        self._boxes = []
+        self._glw = None                # виджет с GL-контекстом; None — работаем через холст
+        self._in_widget = False         # объём сейчас рисуется в виджет, а не в картинку
         self._vis_tm = None             # собранный кусок местности под видимость, с ключом
         self._drag = None
         self._panning = False
@@ -980,6 +1012,35 @@ class EditorFrame(ttk.Frame):
         self.canvas.bind("<ButtonRelease-2>", self.on_release)
         self.canvas.bind("<Motion>", self.on_hover)
         self.canvas.bind("<MouseWheel>", self.on_wheel)
+
+        # Виджет с настоящим GL-контекстом: в объёме показываем его вместо холста. Замер, ради
+        # которого всё затевалось: кадр через холст стоит около 82 мс, из них 42 уходит на то,
+        # чтобы перегнать готовую картинку в tkinter, и ещё 5.6 на чтение её с видеокарты. В
+        # окно тот же кадр рисуется за 5 мс.
+        #
+        # Привязки ТЕ ЖЕ и в том же порядке: иначе в объёме отвалился бы весь ввод.
+        self._glw = None
+        cls = _gl_widget_class()
+        if cls is not None:
+            try:
+                self._glw = cls(self, self, width=800, height=600)
+                self._glw.animate = 0
+                for seq, fn in (("<Configure>", self.on_resize),
+                                ("<ButtonPress-1>", self.on_press),
+                                ("<B1-Motion>", self.on_motion),
+                                ("<ButtonRelease-1>", self.on_release),
+                                ("<Double-Button-1>", self.on_double),
+                                ("<ButtonPress-3>", self.on_right),
+                                ("<B3-Motion>", self.on_motion),
+                                ("<ButtonRelease-3>", self.on_release),
+                                ("<ButtonPress-2>", self._start_pan),
+                                ("<B2-Motion>", self.on_motion),
+                                ("<ButtonRelease-2>", self.on_release),
+                                ("<Motion>", self.on_hover),
+                                ("<MouseWheel>", self.on_wheel)):
+                    self._glw.bind(seq, fn)
+            except Exception:                                # noqa: BLE001
+                self._glw = None
 
         side = ttk.Frame(self, width=352)
         side.pack(side="left", fill="y")
@@ -1525,7 +1586,34 @@ class EditorFrame(ttk.Frame):
         if self._fly or abs(self._fly_v[0]) + abs(self._fly_v[1]) > 0 or self._zoom_goal:
             self._fly_job = self.after(16, self._fly_tick)
 
+    def _swap_view_widget(self):
+        """Показать под объём виджет с GL-контекстом, под план — холст.
+
+        Меняем именно ВИДЖЕТ, а не способ рисования внутри одного: у холста нет контекста, и
+        любой обходной путь упирался бы в перегон картинки, ради избавления от которого всё и
+        затевалось. Панель справа при этом не трогаем — она в другом упаковщике."""
+        want = bool(self.mode3d.get()) and self._glw is not None
+        if want == self._in_widget:
+            return
+        if want:
+            self.canvas.pack_forget()
+            self._glw.pack(side="left", fill="both", expand=True)
+            self._in_widget = True
+            # старый закадровый рисовальщик больше не нужен: контекст будет у виджета
+            self._gl, self._gl_off = None, False
+            self.update_idletasks()
+            self._glw.focus_set()
+        else:
+            self._glw.pack_forget()
+            self.canvas.pack(side="left", fill="both", expand=True)
+            self._in_widget = False
+            self._gl, self._gl_off = None, False
+            self.update_idletasks()
+        w = self._glw if want else self.canvas
+        self.W, self.H = max(2, w.winfo_width()), max(2, w.winfo_height())
+
     def _toggle_3d(self):
+        self._swap_view_widget()
         self.cam.tx, self.cam.ty = self.doc.size_m[0] / 2, self.doc.size_m[1] / 2
         self.cam.dist = max(self.doc.size_m) * 1.9   # чтобы карта целиком помещалась в кадр
         self.cam.bounds = tuple(self.doc.size_m)
@@ -1728,23 +1816,86 @@ class EditorFrame(ttk.Frame):
         Высота — из h_m фигуры, если её задали, иначе условная по следу."""
         if not self.show_houses3d.get():
             return []
+        rects = [sh["rect_m"] + [sh.get("h_m")] for sh in self.doc.shapes
+                 if sh["kind"] == "building"]
+        if not rects:
+            return []
+        # Считаем ПАЧКОЙ. По одному дому это 16.5 мс на театре в 311 строений — и уходило оно
+        # на каждый кадр, потому что при протяжке версия карты меняется на каждое движение и
+        # никакой кэш не спасает. Дешевле сделать сам пересчёт, чем угадывать, когда его пропустить.
+        a = np.asarray([[r[0], r[1], r[2], r[3], r[4]] for r in rects], dtype=np.float64)
+        cx, cy, bw, bh, ang = a[:, 0], a[:, 1], a[:, 2], a[:, 3], a[:, 4]
+        ca, sa = np.cos(np.radians(ang)), np.sin(np.radians(ang))
+        hw, hh = bw / 2.0, bh / 2.0
+        dx = np.stack([-hw, hw, hw, -hw], axis=1)
+        dy = np.stack([-hh, -hh, hh, hh], axis=1)
+        qx = cx[:, None] + dx * ca[:, None] - dy * sa[:, None]
+        qy = cy[:, None] + dx * sa[:, None] + dy * ca[:, None]
         cell = self._height_cell()
         h = self.doc.height_m(cell)
-        out = []
-        for sh in self.doc.shapes:
-            if sh["kind"] != "building":
-                continue
-            cx, cy, bw, bh, ang = sh["rect_m"]
-            pts = vectormap._rect_points(cx, cy, bw, bh, ang)
-            if h is None:
-                z0 = 0.0
-            else:
-                zs = [float(h[int(np.clip(q[0] / cell, 0, h.shape[0] - 1)),
-                              int(np.clip(q[1] / cell, 0, h.shape[1] - 1))]) for q in pts]
-                z0 = min(zs)
-            hgt = float(sh.get("h_m") or view3d.building_height_m(bw, bh))
-            out.append((cx, cy, bw, bh, ang, z0 - 1.0, z0 + hgt))
-        return out
+        if h is None:
+            z0 = np.zeros(len(rects))
+        else:
+            gx = np.clip((qx / cell).astype(np.int32), 0, h.shape[0] - 1)
+            gy = np.clip((qy / cell).astype(np.int32), 0, h.shape[1] - 1)
+            z0 = h[gx, gy].min(axis=1)          # низ по самому низкому из четырёх углов
+        auto = np.clip(0.75 * np.minimum(bw, bh), 4.0, 20.0)
+        hgt = np.array([float(r[5]) if r[5] else 0.0 for r in rects])
+        hgt = np.where(hgt > 0.0, hgt, auto)
+        return [(float(cx[i]), float(cy[i]), float(bw[i]), float(bh[i]), float(ang[i]),
+                 float(z0[i]) - 1.0, float(z0[i]) + float(hgt[i])) for i in range(len(rects))]
+
+    def _gl_widget_init(self):
+        """Завести GLView на контексте виджета. Возвращает, вышло ли."""
+        try:
+            import moderngl
+            import view3d_gpu
+            ctx = moderngl.create_context()
+            self._gl = view3d_gpu.GLView((max(2, self.W), max(2, self.H)), ctx=ctx)
+            self._gl_off = False
+            return True
+        except Exception as ex:                              # noqa: BLE001
+            print("объём в окне не завёлся, работаем через холст (%s)" % ex)
+            self._gl = None
+            self._use_canvas_3d()
+            return False
+
+    def _gl_widget_redraw(self):
+        """Кадр объёмного вида ПРЯМО В ОКНО плюс наложения одной картинкой.
+
+        Наложения рисуются тем же кодом, что и раньше, — просто в прозрачный слой, а не поверх
+        готового кадра. Так весь рисующий код на PIL остался нетронутым: обводка, узлы,
+        черновик, линейка, кольца дальностей и счётчик кадров."""
+        self._sync_cam_ground()
+        self._gl_frame()
+        if self._gl_off:
+            self._use_canvas_3d()
+            return
+        over = Image.new("RGBA", (self.W, self.H), (0, 0, 0, 0))
+        self._shapes_overlay_3d(over)
+        self._draft_overlay_3d(over)
+        self._ruler_overlay_3d(over)
+        self._vision_rings_3d(over)
+        self._fps_into(over)
+        self._gl.blit_overlay(np.asarray(over))
+
+    def _fps_into(self, over):
+        """Счётчик кадров в наложение: на холсте он был элементом Canvas, а холста тут нет."""
+        ms = (time.perf_counter() - self._t_frame) * 1000.0
+        self._fps_ms = ms if self._fps_ms is None else 0.82 * self._fps_ms + 0.18 * ms
+        if not self.show_fps.get():
+            return
+        d = ImageDraw.Draw(over, "RGBA")
+        txt = "%.0f к/с · %.1f мс" % (1000.0 / max(self._fps_ms, 0.05), self._fps_ms)
+        d.rectangle([6, 4, 6 + 8 * len(txt) + 10, 26], fill=(16, 17, 20, 170))
+        d.text((12, 9), txt, fill=(215, 220, 228, 255), font=self.font_small)
+
+    def _use_canvas_3d(self):
+        """Вернуться к холсту: видеокарты нет или контекст не завёлся."""
+        self._in_widget = False
+        if self._glw is not None:
+            self._glw.pack_forget()
+        self.canvas.pack(side="left", fill="both", expand=True)
 
     def _gl_frame(self):
         """Кадр видеокартой или None, если её нет. Контекст, поле высот и картинки тайлов живут
@@ -1759,9 +1910,14 @@ class EditorFrame(ttk.Frame):
             cell_h = self._height_cell()
             height = self.doc.height_m(cell_h)
             self._gl.set_height(height, cell_h, key=(self.doc.hversion, cell_h))
-            self._gl.set_buildings(self._building_boxes(),
-                                   key=(self.doc.version, self.doc.hversion,
-                                        self.show_houses3d.get()))
+            # Коробки считаем ТОЛЬКО при смене карты. Ключ в set_buildings берёг лишь сборку
+            # сетки на видеокарте, а сам список пересчитывался каждый кадр — аргумент-то
+            # вычисляется до вызова. На театре это 16.5 мс на кадр из ниоткуда: те самые
+            # «необъяснённые» миллисекунды в разборе кадра.
+            b_key = (self.doc.version, self.doc.hversion, self.show_houses3d.get())
+            if b_key != self._boxes_key:
+                self._boxes_key, self._boxes = b_key, self._building_boxes()
+            self._gl.set_buildings(self._boxes, key=b_key)
             grid = self._tile_grid()
             top = (grid.levels - 1, 0, 0)
             if grid.get(top) is None:
@@ -1832,6 +1988,10 @@ class EditorFrame(ttk.Frame):
         метров, вдали крупнее. Программный рисовальщик остаётся запасным, но кусков не умеет: он
         рисует всю карту одной грубой сеткой (замер: 42x42 — 22 мс, 85x85 — 66, 170x170 — 282)."""
         self._t_frame = time.perf_counter()
+        if self._in_widget and self._glw is not None:
+            # виджет сам вызовет _gl_widget_redraw и сменит буферы
+            self._glw.tkExpose(None)
+            return
         self._sync_cam_ground()
         img = self._gl_frame()
         if img is None:
