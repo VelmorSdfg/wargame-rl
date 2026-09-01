@@ -168,7 +168,15 @@ void main() { f_color = vec4(mix(horizon, top, clamp(-v_t * 0.5 + 0.5, 0.0, 1.0)
 def _mvp(cam, size):
     """Матрица мира-в-экран. Камера та же, что в view3d.project: фокус равен ширине кадра —
     иначе на видеокарте карта выглядит мельче, и переключение рисовальщика видно как скачок.
-    Вертикаль перевёрнута нарочно: тогда снимок читается сразу сверху вниз, без переворота."""
+
+    Вертикаль перевёрнута нарочно: у OpenGL начало кадра внизу, а PIL читает сверху вниз, и
+    перевёрнутая матрица гасит это расхождение прямо при рисовании.
+
+    ОТМЕНЁННАЯ ЗАМЕРОМ ПОПЫТКА: при выводе прямо в окно читать нечего, и напрашивалось просто
+    не переворачивать матрицу. Не годится — НЕБО рисуется прямо в клипе и матрице не подчиняется,
+    поэтому местность переворачивалась, а градиент неба оставался: замер против программного
+    рисовальщика дал 5.6 из 255 «как есть» и 22.1 «перевёрнутым», то есть ни то ни другое.
+    Переворачивать надо ОДИН РАЗ и всё сразу — этим занят вывод в окно (см. frame)."""
     w, h = size
     yaw, pitch = math.radians(cam.yaw), math.radians(cam.pitch)
     # Знак поворота — как в view3d.project (там мир вращается на -yaw). Со знаком наоборот
@@ -297,6 +305,8 @@ class GLView:
         self._over_tex = None            # наложения одной картинкой поверх кадра
         self._prog_flat = None
         self._vao_flat = None
+        self._scr_tex = None             # сглаженный кадр перед выводом в окно
+        self._scr_fbo = None
         self._hkey = None
         self._hmap = None
         self._over = None
@@ -315,6 +325,16 @@ class GLView:
                                          self.ctx.depth_renderbuffer(size, samples=self.samples))
         self.plain = self.ctx.framebuffer(self.ctx.renderbuffer(size),
                                           self.ctx.depth_renderbuffer(size))
+        if self.to_screen:
+            # Для окна нужен ТЕКСТУРНЫЙ буфер: сглаженный кадр разрешаем в него, а на экран
+            # кладём четырёхугольником с перевёрнутой вертикалью. Простым copy_framebuffer
+            # нельзя — он не умеет переворачивать, а перевернуть надо ВСЁ разом, вместе с небом.
+            if self._scr_tex is not None:
+                self._scr_tex.release()
+                self._scr_fbo.release()
+            self._scr_tex = self.ctx.texture(size, 3)
+            self._scr_tex.filter = (self.mgl.NEAREST, self.mgl.NEAREST)
+            self._scr_fbo = self.ctx.framebuffer(self._scr_tex)
 
     def _grid(self, n):
         got = self._grids.get(n)
@@ -354,6 +374,22 @@ class GLView:
         scr = self.ctx.screen
         return scr if scr is not None else self.ctx.detect_framebuffer()
 
+    def _flat_quad(self, tex, unit):
+        """Положить текстуру на весь экран, перевернув по вертикали. Общее для кадра и наложений:
+        и то и другое живёт в координатах PIL, где строка 0 сверху."""
+        if self._prog_flat is None:
+            self._prog_flat = self.ctx.program(vertex_shader=VERT_FLAT,
+                                               fragment_shader=FRAG_FLAT)
+            quad = np.array([-1, -1, 3, -1, -1, 3], dtype="f4")
+            self._vao_flat = self.ctx.vertex_array(
+                self._prog_flat, [(self.ctx.buffer(quad.tobytes()), "2f", "in_pos")])
+        self._screen().use()
+        self.ctx.disable(self.mgl.DEPTH_TEST)
+        tex.use(unit)
+        self._prog_flat["over"].value = unit
+        self._vao_flat.render()
+        self.ctx.enable(self.mgl.DEPTH_TEST)
+
     def blit_overlay(self, rgba):
         """Наложения поверх кадра ОДНОЙ картинкой: обводка, узлы, черновик, линейка, счётчик.
 
@@ -371,18 +407,7 @@ class GLView:
             self._over_tex.filter = (self.mgl.NEAREST, self.mgl.NEAREST)
         else:
             self._over_tex.write(img)
-        if self._prog_flat is None:
-            self._prog_flat = self.ctx.program(vertex_shader=VERT_FLAT,
-                                               fragment_shader=FRAG_FLAT)
-            quad = np.array([-1, -1, 3, -1, -1, 3], dtype="f4")
-            self._vao_flat = self.ctx.vertex_array(
-                self._prog_flat, [(self.ctx.buffer(quad.tobytes()), "2f", "in_pos")])
-        self._screen().use()
-        self.ctx.disable(self.mgl.DEPTH_TEST)
-        self._over_tex.use(3)
-        self._prog_flat["over"].value = 3
-        self._vao_flat.render()
-        self.ctx.enable(self.mgl.DEPTH_TEST)
+        self._flat_quad(self._over_tex, 3)
 
     def set_buildings(self, boxes, key=None):
         """Коробки домов одной сеткой. Пересобираем только при смене карты: строений на театре
@@ -545,9 +570,13 @@ class GLView:
                 self.prog["texrect"].value = (float(u0), float(v0), float(du), float(dv))
                 self._grid(segs).render()
         if self.to_screen:
-            # сглаженный кадр переливаем прямо в окно. MSAA держим СВОЙ, а не просим у окна:
-            # так сглаживание не зависит от того, каким контекст создал виджет
-            self.ctx.copy_framebuffer(self._screen(), self.msaa)
+            # Сглаженный кадр разрешаем в текстуру и кладём на экран перевёрнутым по вертикали.
+            # MSAA держим СВОЙ, а не просим у окна: сглаживание не должно зависеть от того,
+            # каким контекст создал виджет. А переворот нужен потому, что вся отрисовка живёт в
+            # координатах PIL (строка 0 сверху) — на этом построен и закадровый путь, и сверка
+            # с программным рисовальщиком.
+            self.ctx.copy_framebuffer(self._scr_fbo, self.msaa)
+            self._flat_quad(self._scr_tex, 4)
             return None
         self.ctx.copy_framebuffer(self.plain, self.msaa)
         return Image.frombytes("RGB", self._size, self.plain.read(components=3))
@@ -558,7 +587,10 @@ VERT_FLAT = """
 in vec2 in_pos;
 out vec2 v_uv;
 void main() {
-    v_uv = in_pos * 0.5 + 0.5;
+    // По вертикали ЗЕРКАЛИМ: строка 0 у PIL сверху, а у текстуры снизу. Без этого наложения
+    // легли бы вверх ногами относительно местности — они же рисуются тем же кодом, что и на
+    // холсте, и про OpenGL ничего не знают.
+    v_uv = vec2(in_pos.x * 0.5 + 0.5, 0.5 - in_pos.y * 0.5);
     gl_Position = vec4(in_pos, 0.0, 1.0);
 }
 """
@@ -570,7 +602,7 @@ in vec2 v_uv;
 out vec4 f_color;
 void main() {
     vec4 c = texture(over, v_uv);
-    if (c.a < 0.004) discard;
+    if (c.a < 0.004) discard;          // у наложений прозрачное не рисуем; у кадра альфа = 1
     f_color = c;
 }
 """
