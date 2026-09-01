@@ -83,6 +83,46 @@ def _seg_hits(poly_a, poly_b):
     return out
 
 
+# Размеры строений — НАСТОЯЩИЕ, а не подогнанные под клетку. Раньше здесь стояло
+# uniform(16, 30) x uniform(11, 20), в городе ещё x1.35: ни одной избы, ни одного сарая, всё
+# размером с сельский клуб. Числа были не небрежностью, а вынужденной подгонкой — пока местность
+# считалась клетками по 30 м, строение мельче примерно 7x7 м до боя не доходило вовсе.
+#
+# VectorTerrain этот порог снял: помеха и материал считаются по фигуре, а не по доле покрытия
+# клетки. Село наконец может состоять из изб.
+#
+# Оговорка: у мелкого дома по-прежнему нет СВОЕЙ КЛЕТКИ, а значит нет и компоненты застройки —
+# занять его отделением нельзя, и в поиске укрытия по сетке он не участвует. Он укрывает и
+# перекрывает обзор, но гарнизона не держит.
+HOUSE_MIX = {
+    #            доля   длина м    ширина м     что это
+    "hamlet":  ((0.45, (8, 12), (6, 9)),      # изба
+                (0.35, (5, 9), (4, 6)),       # сарай, баня, хлев
+                (0.20, (14, 22), (8, 12))),   # дом с пристройками
+    "village": ((0.38, (9, 14), (7, 10)),     # изба
+                (0.24, (5, 9), (4, 7)),       # сарай
+                (0.26, (16, 24), (9, 13)),    # дом побольше, лавка, школа
+                (0.12, (30, 60), (10, 16))),  # коровник, склад, мастерская
+    "town":    ((0.28, (12, 20), (8, 12)),    # частный сектор
+                (0.34, (24, 40), (10, 14)),   # многоквартирный
+                (0.20, (45, 75), (11, 16)),   # длинный дом
+                (0.18, (6, 10), (4, 8))),     # гаражи и сараи во дворах
+}
+
+
+def _house_size(rng, kind):
+    """Длина и ширина строения по жребию из смеси своего посёлка."""
+    mix = HOUSE_MIX.get(kind, HOUSE_MIX["village"])
+    r = float(rng.random()) * sum(m[0] for m in mix)
+    acc = 0.0
+    for share, (lo_l, hi_l), (lo_w, hi_w) in mix:
+        acc += share
+        if r <= acc:
+            return float(rng.uniform(lo_l, hi_l)), float(rng.uniform(lo_w, hi_w))
+    share, (lo_l, hi_l), (lo_w, hi_w) = mix[-1]
+    return float(rng.uniform(lo_l, hi_l)), float(rng.uniform(lo_w, hi_w))
+
+
 def _clamp_pts(pts, size):
     return [[float(np.clip(x, 0, size)), float(np.clip(y, 0, size))] for x, y in pts]
 
@@ -379,11 +419,10 @@ def generate(size_m=2550.0, seed=0, battle_edges=True):
                 pnt = base + dirv * along + perp * sidep
                 if not (0 < pnt[0] < S and 0 < pnt[1] < S):
                     continue
-                big = 1.35 if kind == "town" else 1.0
+                w_m, h_m = _house_size(rng, kind)
                 shapes.append({"kind": "building",
                                "rect_m": [round(float(pnt[0]), 1), round(float(pnt[1]), 1),
-                                          round(float(rng.uniform(16, 30) * big), 1),
-                                          round(float(rng.uniform(11, 20) * big), 1),
+                                          round(w_m, 1), round(h_m, 1),
                                           round(float(math.degrees(math.atan2(dirv[1], dirv[0]))
                                                       + rng.uniform(-10, 10)), 1)],
                                "capacity": 1})

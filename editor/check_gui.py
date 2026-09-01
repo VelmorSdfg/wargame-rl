@@ -551,7 +551,7 @@ def main():
     lb_surf, _ = e.doc.surface(e.doc.cell_m)
     lb_lost = e.lost_buildings(lb_surf, e.doc.cell_m)
     ok((n_keep in lb_lost) and (n_keep + 1 not in lb_lost),
-       f"замер видит строения, которые не дойдут до боя: сарай 8x6 помечен, дом 18x10 нет "
+       f"замер видит строения без своей клетки: сарай 8x6 помечен, дом 18x10 нет "
        f"(помечено {len(lb_lost)})")
     e.do_undo()
 
@@ -1179,9 +1179,18 @@ def main():
     e.relief_slope.set(60.0)
     before = float(e.doc.height_m(15.0).max())
     hver, ver = e.doc.hversion, e.doc.version
-    for px, py in ((420, 380), (700, 350), (760, 520), (450, 540)):
-        e.on_press(Ev(px, py))
-    ok(e._draft is not None and len(e._draft) == 4, "точки фигуры ставятся прямо в объёме")
+    # Точки берём ПРОЕКЦИЕЙ известной земли, а не фиксированными пикселями. Раньше здесь стоял
+    # список экранных координат, подобранный под тогдашнюю случайную карту: стоило генератору
+    # начать ставить дома другого размера — поток случайных чисел сдвинулся, карта вышла иной,
+    # и один из четырёх щелчков ушёл в небо. Проверка краснела на исправном коде.
+    quad_m = [(e.cam.tx - 120.0, e.cam.ty - 120.0), (e.cam.tx + 120.0, e.cam.ty - 120.0),
+              (e.cam.tx + 120.0, e.cam.ty + 120.0), (e.cam.tx - 120.0, e.cam.ty + 120.0)]
+    quad_scr, quad_vis = e._project_ground(quad_m)
+    for (qx, qy), seen_ in zip(quad_scr, quad_vis):
+        if seen_:
+            e.on_press(Ev(int(qx), int(qy)))
+    ok(e._draft is not None and len(e._draft) == 4,
+       f"точки фигуры ставятся прямо в объёме ({0 if e._draft is None else len(e._draft)} из 4)")
 
     # Чертёж должен быть ВИДЕН и ТЯНУТЬСЯ ЗА КУРСОРОМ: без нити рисование выглядит мёртвым —
     # поставил точку и до следующего щелчка на экране ничего не меняется.
