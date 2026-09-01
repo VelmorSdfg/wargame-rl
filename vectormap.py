@@ -890,6 +890,209 @@ def crossing_gaps(doc, tol_m=60.0, only=None):
     return out
 
 
+# ------------------------------------------------------------ линия огня по вектору
+
+
+def _poly_inside_len(p0, p1, poly):
+    """Длина отрезка p0->p1 ВНУТРИ многоугольника. Основной примитив всей затеи.
+
+    Находим доли t, где отрезок пересекает рёбра, режем ими отрезок и складываем куски, чья
+    середина оказалась внутри. Проверка серединой, а не чётностью пересечений, нарочно: она
+    одинаково верна для невыпуклых фигур, для касаний ребром и для случая, когда конец луча
+    лежит внутри, — а чётность на касаниях врёт."""
+    x0, y0 = float(p0[0]), float(p0[1])
+    dx, dy = float(p1[0]) - x0, float(p1[1]) - y0
+    n = len(poly)
+    ts = []
+    for k in range(n):
+        ax, ay = poly[k]
+        bx, by = poly[(k + 1) % n]
+        ex, ey = bx - ax, by - ay
+        den = dx * ey - dy * ex
+        if abs(den) < 1e-12:
+            continue                                   # параллельны
+        t = ((ax - x0) * ey - (ay - y0) * ex) / den
+        u = ((ax - x0) * dy - (ay - y0) * dx) / den
+        if -1e-9 <= t <= 1.0 + 1e-9 and -1e-9 <= u <= 1.0 + 1e-9:
+            ts.append(min(1.0, max(0.0, t)))
+    if not ts:
+        # ни одного пересечения: либо весь отрезок внутри, либо весь снаружи
+        return math.hypot(dx, dy) if _pt_in_poly((x0 + dx * 0.5, y0 + dy * 0.5), poly) else 0.0
+    bounds = [0.0] + sorted(set(round(t, 9) for t in ts)) + [1.0]
+    L = math.hypot(dx, dy)
+    total = 0.0
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        if b - a < 1e-12:
+            continue
+        m = (a + b) * 0.5
+        if _pt_in_poly((x0 + dx * m, y0 + dy * m), poly):
+            total += (b - a) * L
+    return total
+
+
+def points_in_poly(xs, ys, poly):
+    """Какие из точек лежат внутри многоугольника — ПАЧКОЙ.
+
+    Нужна просмотру прострелов: он берёт тысячи точек по лучам разом, и спрашивать про каждую
+    по отдельности значило бы считать секундами вместо миллисекунд."""
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
+    inside = np.zeros(xs.shape, dtype=bool)
+    n = len(poly)
+    for k in range(n):
+        ax, ay = poly[k]
+        bx, by = poly[(k + 1) % n]
+        if ay == by:
+            continue
+        cross = (ay > ys) != (by > ys)
+        if not cross.any():
+            continue
+        xx = ax + (ys - ay) * (bx - ax) / (by - ay)
+        inside ^= cross & (xs < xx)
+    return inside
+
+
+def _pt_in_poly(pt, poly):
+    x, y = pt
+    inside = False
+    n = len(poly)
+    for k in range(n):
+        ax, ay = poly[k]
+        bx, by = poly[(k + 1) % n]
+        if (ay > y) != (by > y):
+            if x < ax + (y - ay) * (bx - ax) / (by - ay):
+                inside = not inside
+    return inside
+
+
+def _strip_quads(pts, half):
+    """Ломаная с шириной -> список четырёхугольников по звеньям. Лесополоса нарисована линией,
+    а помеха у неё имеет ширину, и мерить её как линию нулевой толщины значило бы не считать
+    вовсе."""
+    out = []
+    for a, b in zip(pts[:-1], pts[1:]):
+        ex, ey = b[0] - a[0], b[1] - a[1]
+        L = math.hypot(ex, ey)
+        if L < 1e-9:
+            continue
+        nx, ny = -ey / L * half, ex / L * half
+        out.append([(a[0] + nx, a[1] + ny), (b[0] + nx, b[1] + ny),
+                    (b[0] - nx, b[1] - ny), (a[0] - nx, a[1] - ny)])
+    return out
+
+
+class VectorLOS(object):
+    """Линия огня ПО ВЕКТОРУ: помеха меряется длиной луча ВНУТРИ фигуры, а не числом клеток.
+
+    Зачем вообще. У сетки есть порог существования: замерено, что при клетке 30 м строение
+    мельче примерно 7x7 м не даёт ни одной клетки и для боя не существует, хотя нарисовано и
+    стоит на карте. Оттуда же и спор за клетку долей покрытия, из-за которого мост в восемь
+    метров проигрывал воде. У вектора порога нет — фигура либо на луче, либо нет, — и от
+    разрешения ничего не зависит вовсе.
+
+    Координаты и пороги — в ИГРОВЫХ ЕДИНИЦАХ, как у terrain.blocked: see_through задан в них
+    же, и мерить длину в метрах значило бы сравнивать разное.
+
+    РЕЛЬЕФ здесь не считается. Высота гладкая и определена всюду, ей растр к лицу; профиль
+    остаётся в terrain.blocked, и вектор его не трогает.
+
+    Номера домов — 1-based по порядку фигур в карте, ровно как building_comp в сетке. Поэтому
+    transparent («своё здание прозрачно для своего огня») ложится сюда без перевода.
+    """
+
+    BUCKET_U = 10.0          # сторона ячейки индекса в игровых единицах (150 м)
+
+    def __init__(self, doc, m_per_unit, cell_u=2.0, origin_m=(0.0, 0.0)):
+        # origin_m — начало окна в метрах. Просмотр прострелов собирает местность НЕ на всю
+        # карту, а куском вокруг точки, и координаты там свои; без сдвига вектор оказался бы
+        # в другом месте, чем сетка.
+        ox, oy = float(origin_m[0]), float(origin_m[1])
+        types, _cov, blocks, _sp, see, _imp, _veh, see_dem = terrain._type_tables()
+        by_name = {name: t["id"] for name, t in types.items()}
+        self.cell_u = float(cell_u)
+        self.parts = []          # (номер дома или 0, полигоны, порог, порог фугаса)
+        n_build = 0
+        for sh in doc.get("shapes", ()):
+            kind = sh.get("kind")
+            tname = sh.get("type")
+            if kind == "building":
+                n_build += 1
+                cx, cy, w, h, ang = sh["rect_m"]
+                polys = [[((q[0] - ox) / m_per_unit, (q[1] - oy) / m_per_unit)
+                          for q in _rect_points(cx, cy, w, h, ang)]]
+                tid = by_name["building"]
+                self.parts.append((n_build, polys, float(see[tid]), float(see_dem[tid])))
+                continue
+            tid = by_name.get(tname)
+            if tid is None or not bool(blocks[tid]):
+                continue                                  # поле, дорога, вода луч не держат
+            if kind == "polygon" and len(sh.get("points", ())) >= 3:
+                polys = [[((q[0] - ox) / m_per_unit, (q[1] - oy) / m_per_unit)
+                          for q in sh["points"]]]
+            elif kind == "line" and len(sh.get("points", ())) >= 2:
+                half = float(sh.get("width_m", 8.0)) / 2.0 / m_per_unit
+                pts = [((q[0] - ox) / m_per_unit, (q[1] - oy) / m_per_unit)
+                       for q in sh["points"]]
+                polys = _strip_quads(pts, half)
+            else:
+                continue
+            self.parts.append((0, polys, float(see[tid]), float(see_dem[tid])))
+
+        # равномерный индекс: без него на театре пришлось бы перебирать все фигуры на КАЖДЫЙ луч
+        self.index = {}
+        for i, (_b, polys, _s, _d) in enumerate(self.parts):
+            xs = [q[0] for pl in polys for q in pl]
+            ys = [q[1] for pl in polys for q in pl]
+            for bx in range(int(math.floor(min(xs) / self.BUCKET_U)),
+                            int(math.floor(max(xs) / self.BUCKET_U)) + 1):
+                for by in range(int(math.floor(min(ys) / self.BUCKET_U)),
+                                int(math.floor(max(ys) / self.BUCKET_U)) + 1):
+                    self.index.setdefault((bx, by), []).append(i)
+
+    def _near(self, p0, p1):
+        got = set()
+        L = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        steps = max(1, int(L / (self.BUCKET_U * 0.5)) + 1)
+        for k in range(steps + 1):
+            t = k / float(steps)
+            bx = int(math.floor((p0[0] + (p1[0] - p0[0]) * t) / self.BUCKET_U))
+            by = int(math.floor((p0[1] + (p1[1] - p0[1]) * t) / self.BUCKET_U))
+            for dbx in (-1, 0, 1):
+                for dby in (-1, 0, 1):
+                    got.update(self.index.get((bx + dbx, by + dby), ()))
+        return got
+
+    def blocked(self, p0, p1, transparent=(), demolish=False):
+        """Перекрыта ли линия огня. Рельеф НЕ проверяется — это забота terrain.blocked."""
+        dx, dy = float(p1[0]) - float(p0[0]), float(p1[1]) - float(p0[1])
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            return False
+        # Своё укрытие не мешает: в сетке из счёта выкидывались клетки стрелка и цели, здесь —
+        # по клетке пути с каждого конца. Без этого стрелок, стоящий в своём же доме или на
+        # опушке, переставал видеть куда бы то ни было.
+        cut = min(0.45, (self.cell_u / dist) if dist > 0 else 0.0)
+        a = (p0[0] + dx * cut, p0[1] + dy * cut)
+        b = (p0[0] + dx * (1.0 - cut), p0[1] + dy * (1.0 - cut))
+        spent = {}
+        for i in self._near(a, b):
+            bnum, polys, see, see_dem = self.parts[i]
+            if bnum and transparent and bnum in transparent:
+                continue                                  # своё здание прозрачно для своего огня
+            lim = see_dem if demolish else see
+            ln = 0.0
+            for pl in polys:
+                ln += _poly_inside_len(a, b, pl)
+            if ln <= 0.0:
+                continue
+            if lim <= 0.0:
+                return True                               # здание гасит луч сразу
+            spent[lim] = spent.get(lim, 0.0) + ln
+            if spent[lim] > lim:
+                return True
+        return False
+
+
 # ---------------------------------------------------------------- граф дорог
 
 

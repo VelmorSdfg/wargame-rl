@@ -115,6 +115,16 @@ class TerrainMap:
         self._road_mask = (self.f_speed_foot > 1.0) | (self.f_speed_veh > 1.0)
         self._cover_mask = self.f_cover > 0
         self._is_building = self.grid == building_id
+        self.vlos = None                 # помехи по вектору; None — считаем клетками, как раньше
+
+    def attach_vector(self, doc, m_per_unit, origin_m=(0.0, 0.0)):
+        """Приложить вектор карты: линия огня начнёт считать помехи по фигурам, а не по клеткам.
+
+        Старые растровые карты (maps/*.npy) вектора не имеют и остаются на клетках — у них нет
+        источника, только результат."""
+        import vectormap
+        self.vlos = vectormap.VectorLOS(doc, m_per_unit, cell_u=self.cell, origin_m=origin_m)
+        return self
 
     def component_at(self, pos):
         """id здания под позицией (0 = не в здании) — для правила «своё здание прозрачно»."""
@@ -463,6 +473,14 @@ class TerrainMap:
             line = h0 + (h1 - h0) * t[keep].astype(np.float32)
             if (self.f_height[ix, iy] > line).any():
                 return True
+
+        # ПОМЕХИ СЧИТАЕТ ВЕКТОР, если он к карте приложен. Рельеф выше остаётся растровым
+        # нарочно: высота гладкая и определена всюду, ей клетки к лицу. А вот лес и строения
+        # у сетки имеют ПОРОГ СУЩЕСТВОВАНИЯ — замерено, что при клетке 30 м дом мельче примерно
+        # 7x7 м не даёт ни одной клетки, и луч проходит сквозь нарисованный дом. У вектора
+        # порога нет, и цена та же: 0.070 мс против 0.071 на театре в 469 помех.
+        if self.vlos is not None:
+            return self.vlos.blocked(p0, p1, transparent, demolish)
 
         blocks = self.f_blocks[ix, iy]
         if not blocks.any():

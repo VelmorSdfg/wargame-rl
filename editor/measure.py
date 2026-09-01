@@ -21,7 +21,7 @@ VIS_MIN, VIS_MAX = 0.25, 0.85
 BAND_M = (300.0, 900.0)
 
 
-def measure(grid, cell_m, n_pairs=600, seed=12345, fields=None):
+def measure(grid, cell_m, n_pairs=600, seed=12345, fields=None, vec=None):
     """Доли типов, видимость на боевой дистанции, строения и вердикт годности.
 
     fields — поля из vectormap.rasterize. Их стоит передавать всегда, когда они есть: там
@@ -34,6 +34,10 @@ def measure(grid, cell_m, n_pairs=600, seed=12345, fields=None):
         tm = terrain.from_fields(grid, f, cell_m / P.M_PER_UNIT)
     else:
         tm = terrain.from_grid(grid, cell_m / P.M_PER_UNIT)
+    if vec is not None:
+        # мерка обязана считать тем же, чем бой: иначе «годна» и «не годна» отвечают про
+        # разные карты
+        tm.attach_vector(vec, P.M_PER_UNIT)
     rng = np.random.default_rng(seed)
     lo_u, hi_u = BAND_M[0] / P.M_PER_UNIT, BAND_M[1] / P.M_PER_UNIT
 

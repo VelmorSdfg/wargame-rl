@@ -555,6 +555,53 @@ def main():
        f"(помечено {len(lb_lost)})")
     e.do_undo()
 
+    # ЛИНИЯ ОГНЯ ПО ВЕКТОРУ. У сетки есть порог существования: дом мельче примерно 7x7 м при
+    # клетке 30 м не даёт ни одной клетки, и луч проходит сквозь нарисованный дом. Вектор меряет
+    # помеху ДЛИНОЙ ЛУЧА ВНУТРИ ФИГУРЫ, порога у него нет, и цена та же.
+    sq_ = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+    ok(abs(vectormap._poly_inside_len((-5.0, 5.0), (15.0, 5.0), sq_) - 10.0) < 1e-6
+       and abs(vectormap._poly_inside_len((5.0, 5.0), (15.0, 5.0), sq_) - 5.0) < 1e-6
+       and vectormap._poly_inside_len((-5.0, 50.0), (15.0, 50.0), sq_) == 0.0,
+       "длина луча внутри фигуры: насквозь, изнутри наружу и мимо")
+    # невыпуклая фигура: буква П, луч режет две ножки по 3
+    u_ = [(0, 0), (10, 0), (10, 30), (7, 30), (7, 3), (3, 3), (3, 30), (0, 30)]
+    ok(abs(vectormap._poly_inside_len((-5.0, 20.0), (15.0, 20.0), u_) - 6.0) < 1e-6,
+       "и на невыпуклой фигуре тоже верно (две ножки по 3)")
+
+    SZ = 2550.0
+    los_doc = vectormap.new_doc((SZ, SZ))
+    los_doc["shapes"].append({"kind": "building", "rect_m": [SZ / 2, SZ / 2, 8.0, 6.0, 0.0],
+                              "capacity": 1})
+    lo = vectormap.rasterize(los_doc, cell_m=30.0)
+    los_tm = terrain.from_fields(lo[0], dict(lo[1]), 30.0 / P.M_PER_UNIT)
+    lp0 = ((SZ / 2 - 300.0) / P.M_PER_UNIT, (SZ / 2) / P.M_PER_UNIT)
+    lp1 = ((SZ / 2 + 300.0) / P.M_PER_UNIT, (SZ / 2) / P.M_PER_UNIT)
+    was_cells = los_tm.blocked(lp0, lp1)
+    los_tm.attach_vector(los_doc, P.M_PER_UNIT)
+    ok((not was_cells) and los_tm.blocked(lp0, lp1),
+       "сарай 8x6: сеткой луч проходит насквозь, вектором перекрыт")
+
+    # лес копит толщину, а не гасит сразу — порог 90 м, как в бою
+    for w_m, want in ((40.0, False), (200.0, True)):
+        fd = vectormap.new_doc((SZ, SZ))
+        fd["shapes"].append({"kind": "polygon", "type": "forest",
+                             "points": [[SZ / 2 - w_m / 2, 0], [SZ / 2 + w_m / 2, 0],
+                                        [SZ / 2 + w_m / 2, SZ], [SZ / 2 - w_m / 2, SZ]]})
+        vl_ = vectormap.VectorLOS(fd, P.M_PER_UNIT, cell_u=30.0 / P.M_PER_UNIT)
+        ok(vl_.blocked(lp0, lp1) is want,
+           f"лес {w_m:.0f} м {'гасит' if want else 'пропускает'} луч (порог 90 м)")
+    ok(not vl_.blocked(lp0, lp1, demolish=True),
+       "фугас видит сквозь тот же лес: у него свой порог")
+
+    bd = vectormap.new_doc((SZ, SZ))
+    bd["shapes"].append({"kind": "building", "rect_m": [SZ / 2, SZ / 2, 40.0, 30.0, 0.0],
+                         "capacity": 1})
+    vb_ = vectormap.VectorLOS(bd, P.M_PER_UNIT, cell_u=30.0 / P.M_PER_UNIT)
+    ok(vb_.blocked(lp0, lp1) and not vb_.blocked(lp0, lp1, transparent={1}),
+       "своё здание прозрачно для своего огня — номера домов те же, что у building_comp")
+    ok(not vb_.blocked(((SZ / 2) / P.M_PER_UNIT, (SZ / 2) / P.M_PER_UNIT), lp1),
+       "изнутри дома наружу видно: своё укрытие не мешает")
+
     # --- линейка
     # Значение снимаем ПОКА ДЕРЖИМ кнопку: линейка гаснет на отпускании (она измерение, а не
     # объект карты), и читать её после — значит читать пустоту.

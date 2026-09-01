@@ -84,6 +84,19 @@ import paint                                                 # noqa: E402
 import tiles as tilemod                                      # noqa: E402
 
 
+VIEW_STEP_M = 15.0         # верхний предел шага выборки по лучу, В МЕТРАХ (раньше шаг был
+#                            жёстко полклетки, и на грубой клетке выходил слишком редким).
+#
+#                            ОТМЕНЁННАЯ ЗАМЕРОМ ГИПОТЕЗА. Казалось, что сарай 8x6 не даёт тени
+#                            в просмотре потому, что луч через него перешагивает. Сгущение шага
+#                            не помогло НИ РАЗУ: 15 м — нет тени (26 мс), 8 м — нет (134 мс),
+#                            5 м — нет (582 мс), 3 м — нет (1276 мс). Дело не в выборке, а в
+#                            разрешении САМОЙ КАРТИНКИ: тень восьмиметрового дома уже клетки в
+#                            30 м, и в ту же клетку попадают лучи, прошедшие мимо, — а поле
+#                            собирается максимумом. При клетке показа 10 м тень появляется
+#                            сразу. Так что мельчить шаг незачем; мельчить надо клетку.
+
+
 def viewshed(tm, center_m, radius_m, m_per_unit, max_rays=1440):
     """Что видно из точки: поле 0..1 — сколько ЗАПАСА ПРОЗРАЧНОСТИ осталось у луча в этой клетке.
 
@@ -115,7 +128,7 @@ def viewshed(tm, center_m, radius_m, m_per_unit, max_rays=1440):
     """
     cx, cy = center_m[0] / m_per_unit, center_m[1] / m_per_unit
     R = radius_m / m_per_unit
-    step = tm.cell * 0.5
+    step = min(tm.cell * 0.5, VIEW_STEP_M / float(m_per_unit))
     n_steps = max(2, int(R / step))
     n_rays = int(np.clip(2.0 * math.pi * R / step, 360, max_rays))
 
@@ -127,8 +140,29 @@ def viewshed(tm, center_m, radius_m, m_per_unit, max_rays=1440):
     gx = np.clip((xs / tm.cell).astype(np.int32), 0, tm.Gx - 1)
     gy = np.clip((ys / tm.cell).astype(np.int32), 0, tm.Gy - 1)
 
-    blocks = tm.f_blocks[gx, gy]
-    lim = tm.f_see[gx, gy]
+    if getattr(tm, "vlos", None) is not None:
+        # ПОМЕХИ ИЗ ВЕКТОРА — тем же смыслом, что в бою. Через сетку было нельзя: у неё есть
+        # порог существования, и дом мельче примерно 7x7 м не даёт ни одной клетки. Просмотр
+        # показывал бы свет там, где бой видит стену, — то самое расхождение, ради которого
+        # вектор и заводился.
+        blocks = np.zeros(xs.shape, dtype=bool)
+        lim = np.full(xs.shape, 1e9, dtype=np.float32)
+        lo_x, hi_x = float(xs.min()), float(xs.max())
+        lo_y, hi_y = float(ys.min()), float(ys.max())
+        for _bnum, polys, see, _dem in tm.vlos.parts:
+            for pl in polys:
+                px = [q[0] for q in pl]
+                py = [q[1] for q in pl]
+                if max(px) < lo_x or min(px) > hi_x or max(py) < lo_y or min(py) > hi_y:
+                    continue                      # фигура вне окна просмотра
+                m = vectormap.points_in_poly(xs, ys, pl)
+                if not m.any():
+                    continue
+                blocks |= m
+                lim = np.where(m, np.minimum(lim, see), lim)
+    else:
+        blocks = tm.f_blocks[gx, gy]
+        lim = tm.f_see[gx, gy]
     # стоимость шага в долях «терпения» луча: непрозрачный материал с нулевым порогом (здание)
     # гасит сразу, прозрачный не стоит ничего
     # непрозрачное с нулевым порогом (здание) гасит луч сразу — берём большое КОНЕЧНОЕ число:
@@ -3062,6 +3096,8 @@ class EditorFrame(ttk.Frame):
             X, Y = np.meshgrid(gx, gy, indexing="ij")
             fields["height"] = vectormap.sample_height(hm, X, Y) / P.M_PER_UNIT
         tm = terrain.from_fields(surf, fields, cell / P.M_PER_UNIT)
+        # тем же вектором, что и бой: просмотр прострелов не должен показывать своё
+        tm.attach_vector(self.doc.vec, P.M_PER_UNIT, origin_m=(x0, y0))
         self._vis_tm = (key, tm)
         return tm, (x0, y0)
 
@@ -4033,7 +4069,7 @@ class EditorFrame(ttk.Frame):
         except (tk.TclError, ValueError):
             cell = self.doc.cell_m
         surface, _ = self.doc.surface(cell)
-        m = measure(surface, cell, n_pairs=400)
+        m = measure(surface, cell, n_pairs=400, vec=self.doc.vec)
         lost = self.lost_buildings(surface, cell)
         m["lost_buildings"] = lost
         self.metrics = m
